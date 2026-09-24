@@ -361,6 +361,7 @@ func (r *raLatencyBCC) startMonitoring() error {
 
 	routeServer, err := newBCCRouteServerObserver(awsRegion, routeServerId)
 	if err != nil {
+		log.Errorf("Failed to create route observer: %v", err)
 		return err
 	}
 
