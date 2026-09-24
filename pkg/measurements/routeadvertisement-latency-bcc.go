@@ -16,11 +16,8 @@ package measurements
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net"
 	"slices"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -125,65 +122,6 @@ func (plmf raLatencyBCCMeasurementFactory) NewMeasurement(jobConfig *config.Job,
 	return &raLatencyBCC{
 		BaseMeasurement: plmf.NewBaseLatency(jobConfig, clientSet, restConfig, raLatencyBCCMeasurement, raLatencyBCCQuantilesMeasurement, embedCfg),
 	}
-}
-
-// unlike default pod network, when a pod is created on udn network, pod ip address is retrieved from pod annotations.
-// we create list of cudn subnet and pod ip mappings. CUdn subnet is considered as a route exported to outside the cluster. When KB wants to ping test the cudn, it pings cudn's pods.
-func (r *raLatencyBCC) getPods() error {
-	var err error
-	listOptions := metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", config.KubeBurnerLabelUUID, r.Uuid)}
-	nsList, err := r.ClientSet.CoreV1().Namespaces().List(context.TODO(), listOptions)
-	if err != nil {
-		log.Errorf("Error listing namespaces: %v", err)
-		return err
-	}
-	for _, ns := range nsList.Items {
-		podList, err := r.ClientSet.CoreV1().Pods(ns.Name).List(context.TODO(), listOptions)
-		if err != nil {
-			log.Errorf("Error listing pods in namespace %s: %v", ns.Name, err)
-			return err
-		}
-		for _, pod := range podList.Items {
-			podNetworks := make(map[string]podAnnotation)
-			ovnAnnotation, ok := pod.Annotations["k8s.ovn.org/pod-networks"]
-			if ok {
-				if err := json.Unmarshal([]byte(ovnAnnotation), &podNetworks); err != nil {
-					log.Errorf("failed to unmarshal ovn pod annotation  %v", err)
-					continue
-				}
-				for pnet, val := range podNetworks {
-					if pnet != "default" {
-						var udn string
-						parts := strings.Split(pnet, "/")
-						if len(parts) == 2 {
-							_, udn = parts[0], parts[1]
-						} else {
-							log.Debugf("Invalid input format")
-							continue
-						}
-						ipAddr, subnet, err := net.ParseCIDR(val.IP)
-						if err != nil {
-							log.Debugf("Unable to get CIDR for IP")
-							continue
-						}
-						subnetString := subnet.String()
-						ipAddrString := ipAddr.String()
-						cudnpods, exists := r.cudnSubnet[subnetString]
-						if exists {
-							cudnpods.pods = append(cudnpods.pods, ipAddrString)
-							r.cudnSubnet[subnetString] = cudnpods
-						} else {
-							r.cudnSubnet[subnetString] = cudnPods{
-								cudn: udn,
-								pods: []string{ipAddrString},
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-	return nil
 }
 
 // Record RouteAdvertisement name and creation timestamp when routeadvertisement resource is detected by the API
@@ -496,10 +434,11 @@ func (r *raLatencyBCC) Start(measurementWg *sync.WaitGroup) error {
 	r.doneCh = make(chan struct{})
 
 	// cudn pods which will be pinged
-	r.cudnSubnet = make(map[string]cudnPods)
-
 	// Maintain a list of cudn subnets and their pods
-	r.getPods()
+	r.cudnSubnet, err = getPods(r.ClientSet, r.Uuid)
+	if err != nil {
+		return err
+	}
 	for subnetString, cudnpods := range r.cudnSubnet {
 		// Example: CUDN: cudn-0, Subnet: 40.0.3.0/24, Pods: [40.0.3.3]
 		log.Debugf("CUDN: %s, Subnet: %s, Pods: %v", cudnpods.cudn, subnetString, cudnpods.pods)

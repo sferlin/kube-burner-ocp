@@ -2,7 +2,7 @@ version: "2"
 linters:
   default: none
   enable:
-    #- dupl
+    - dupl
     - goconst
     - gocyclo
     - govet
