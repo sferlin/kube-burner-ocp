@@ -316,12 +316,14 @@ type newRoute struct {
 	Dst string
 }
 
-//nolint:unparam // TODO
-func (r *raLatencyBCC) observerWorker(routeServer *bccRouteServerObserver, routeCh chan<- newRoute) {
+func (r *raLatencyBCC) observerWorker(routeServer *bccRouteServerObserver, routeCh chan<- newRoute, baselineReadCh chan<- struct{}) {
 	defer r.wg.Done()
 
 	ticker := time.NewTicker(routesPollInterval)
 	defer ticker.Stop()
+
+	baselineRead := false
+	currentSubnets := make(map[string]bool)
 
 	for {
 		select {
@@ -331,9 +333,32 @@ func (r *raLatencyBCC) observerWorker(routeServer *bccRouteServerObserver, route
 				log.Warnf("BCC AWS Route Server query failed: %v", err)
 				continue
 			}
+
+			fetchedSubnets := make(map[string]bool)
 			for _, route := range routes {
-				log.Warnf("SAW ROUTE: %s", aws.ToString(route.Prefix))
-				// TODO: send only new route to routeCh
+				subnetString := aws.ToString(route.Prefix)
+				fetchedSubnets[subnetString] = true
+				if _, exists := currentSubnets[subnetString]; !exists {
+					currentSubnets[subnetString] = true
+					if baselineRead {
+						// New route detected, send it to the worker channel
+						log.Debugf("New route detected: %s", subnetString)
+						routeCh <- newRoute{Dst: subnetString}
+					}
+				}
+			}
+
+			// Remove subnets that are no longer present in the fetched routes
+			for subnet := range currentSubnets {
+				if !fetchedSubnets[subnet] {
+					delete(currentSubnets, subnet)
+					log.Debugf("Route removed: %s", subnet)
+				}
+			}
+
+			if !baselineRead {
+				baselineRead = true
+				close(baselineReadCh)
 			}
 		case <-r.doneCh:
 			return
@@ -403,9 +428,11 @@ func (r *raLatencyBCC) startMonitoring() error {
 
 	// Start observer goroutine to poll AWS Route Server for route changes
 	routeCh := make(chan newRoute, 1000)
+	baselineReadCh := make(chan struct{})
 
 	r.wg.Add(1)
-	go r.observerWorker(routeServer, routeCh)
+	go r.observerWorker(routeServer, routeCh, baselineReadCh)
+	<-baselineReadCh // wait for baseline read to complete before starting workers
 
 	// Start worker goroutines
 	for range workerCount {
@@ -473,6 +500,10 @@ func (r *raLatencyBCC) Start(measurementWg *sync.WaitGroup) error {
 
 	// Maintain a list of cudn subnets and their pods
 	r.getPods()
+	for subnetString, cudnpods := range r.cudnSubnet {
+		// Example: CUDN: cudn-0, Subnet: 40.0.3.0/24, Pods: [40.0.3.3]
+		log.Debugf("CUDN: %s, Subnet: %s, Pods: %v", cudnpods.cudn, subnetString, cudnpods.pods)
+	}
 
 	if err = r.startMonitoring(); err != nil {
 		return err
