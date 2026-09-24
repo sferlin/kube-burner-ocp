@@ -115,3 +115,5 @@ jobs:
         inputVars:
           maxTimeout: 10m
           layer2: {{.LAYER2}}
+          awsRegion: {{.AWS_REGION}}
+          routeServerId: {{.ROUTE_SERVER_ID}}

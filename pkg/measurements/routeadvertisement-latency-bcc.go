@@ -25,6 +25,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	k8sconnector "github.com/cloud-bulldozer/go-commons/v2/k8s-connector"
 	"github.com/kube-burner/kube-burner/v2/pkg/config"
 	"github.com/kube-burner/kube-burner/v2/pkg/measurements"
@@ -50,6 +54,12 @@ const (
 var (
 	// Max timeout to wait for finishing work
 	maxTimeout time.Duration = 1 * time.Minute
+	// AWS region where the route server is deployed
+	awsRegion string
+	// AWS Route Server ID
+	routeServerId string
+	// AWS Route Server poll interval
+	routesPollInterval time.Duration = 1 * time.Second
 
 	supportedRaLatencyBCCJobTypes = []config.JobType{config.CreationJob, config.PatchJob}
 )
@@ -78,13 +88,13 @@ type raMetricBCC struct {
 }
 
 // type holds route detection and cund pod's ping timestamps
-/*type netlinkRoutes struct {
-	// linux doesn't allow adding duplicate routes, so routeTimestamp is not a slice
-	// measure timestamp when a route (belonging to cudn's subnet) detected by the kernel
+type detectedRoutes struct {
+	// duplicate routes are not allowed, so routeTimestamp is not a slice
+	// measure timestamp when a route (belonging to cudn's subnet) is first seen
 	routeTimestamp time.Time
-	// cudn subnet is exported as route. KB detected this route in its host. Now KB pings the corresponding cudn's pod and stores success timestamp.
+	// cudn subnet is exported as route. KB saw this route. Now KB pings the corresponding cudn's pod and stores success timestamp.
 	pingTimestamps []time.Time
-}*/
+}
 
 type raLatencyBCC struct {
 	measurements.BaseMeasurement
@@ -246,6 +256,91 @@ func (r *raLatencyBCC) handleAdd(obj any) {
 	})
 }
 
+type bccRouteServerObserver struct {
+	client        *ec2.Client
+	routeServerID string
+}
+
+func newBCCRouteServerObserver(region, routeServerID string) (*bccRouteServerObserver, error) {
+	if region == "" {
+		return nil, fmt.Errorf("AWS region is empty")
+	}
+	if routeServerID == "" {
+		return nil, fmt.Errorf("AWS Route Server ID is empty")
+	}
+
+	// Loads credentials, region, profile, IAM role, etc.
+	cfg, err := awsconfig.LoadDefaultConfig(context.Background(), awsconfig.WithRegion(region))
+	if err != nil {
+		return nil, fmt.Errorf("unable to load AWS config: %w", err)
+	}
+
+	return &bccRouteServerObserver{
+		client:        ec2.NewFromConfig(cfg),
+		routeServerID: routeServerID,
+	}, nil
+}
+
+func (o *bccRouteServerObserver) getRoutes(ctx context.Context) ([]ec2types.RouteServerRoute, error) {
+	var routes []ec2types.RouteServerRoute
+	var nextToken *string
+
+	for {
+		input := &ec2.GetRouteServerRoutingDatabaseInput{
+			RouteServerId: aws.String(o.routeServerID),
+			MaxResults:    aws.Int32(1000),
+			NextToken:     nextToken,
+		}
+
+		output, err := o.client.GetRouteServerRoutingDatabase(ctx, input)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"get route server routing database: %w",
+				err,
+			)
+		}
+
+		routes = append(routes, output.Routes...)
+
+		if output.NextToken == nil || aws.ToString(output.NextToken) == "" {
+			break
+		}
+
+		nextToken = output.NextToken
+	}
+
+	return routes, nil
+}
+
+type newRoute struct {
+	Dst string
+}
+
+//nolint:unparam // TODO
+func (r *raLatencyBCC) observerWorker(routeServer *bccRouteServerObserver, routeCh chan<- newRoute) {
+	defer r.wg.Done()
+
+	ticker := time.NewTicker(routesPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			routes, err := routeServer.getRoutes(context.Background())
+			if err != nil {
+				log.Warnf("BCC AWS Route Server query failed: %v", err)
+				continue
+			}
+			for _, route := range routes {
+				log.Warnf("SAW ROUTE: %s", aws.ToString(route.Prefix))
+				// TODO: send only new route to routeCh
+			}
+		case <-r.doneCh:
+			return
+		}
+	}
+}
+
 /*
 When KB creates RA CRDs, CUDN subnets are advertised and become observable from the AWS Route Server.
 
@@ -254,28 +349,27 @@ This go thread, reads the route(nothing but the subnet), retrieve the correspond
 Note: we have only one pod per cudn subnet. So when a cudn subnet is detected, we ping only one pod (i.e the subnet's corresponding pod). So we don't need parallel executing of ping test.
 */
 
-func (r *raLatencyBCC) worker() {
-	r.wg.Done()
+func (r *raLatencyBCC) worker(routeCh <-chan newRoute) {
+	defer r.wg.Done()
 	for {
 		select {
-		/*case update, ok := <-r.routeCh:
-		if !ok {
-			return
-		}
-		if update.Type == unix.RTM_NEWROUTE {
-			cudnpods, exists := r.cudnSubnet[update.Dst.String()]
+		case update, ok := <-routeCh:
+			if !ok {
+				return
+			}
+			cudnpods, exists := r.cudnSubnet[update.Dst]
 			if exists {
-				// linux doesn't allow adding duplicate routes, so new routeTimestamp should be added
-				log.Debugf("Netlink route: %s received for udn: %s at: %v", update.Dst.String(), cudnpods.cudn, time.Now().UTC())
-				val, _ := r.cudnConnTimestamp.LoadOrStore(cudnpods.cudn, netlinkRoutes{
+				// duplicate routes are not allowed, so new routeTimestamp should be added
+				log.Debugf("Route: %s received for udn: %s at: %v", update.Dst, cudnpods.cudn, time.Now().UTC())
+				val, _ := r.cudnConnTimestamp.LoadOrStore(cudnpods.cudn, detectedRoutes{
 					routeTimestamp: time.Now().UTC(),
 					pingTimestamps: []time.Time{}})
-				if nlRouteVal, ok := val.(netlinkRoutes); ok {
+				if nlRouteVal, ok := val.(detectedRoutes); ok {
 					pingSuccess := nlRouteVal.pingTimestamps
 					for _, pod := range cudnpods.pods {
 						for range pingAttempts {
 							if err := pingAddress("", pod, exportPingerTimeoutMsec); err == nil {
-								log.Debugf("Ping success to pod %s for the Netlink route: %s received for udn: %s at: %v", pod, update.Dst.String(), cudnpods.cudn, time.Now().UTC())
+								log.Debugf("Ping success to pod %s for the route: %s received for udn: %s at: %v", pod, update.Dst, cudnpods.cudn, time.Now().UTC())
 								pingSuccess = append(pingSuccess, time.Now().UTC())
 								break
 							}
@@ -283,13 +377,12 @@ func (r *raLatencyBCC) worker() {
 						}
 					}
 					nlRouteVal.pingTimestamps = pingSuccess
-					atomic.AddUint64(&r.verifiedExportRouteCount, 1)
+					atomic.AddUint64(&r.verifiedRouteCount, 1)
 					r.cudnConnTimestamp.Store(cudnpods.cudn, nlRouteVal)
 				}
 			}
-		}*/
 		case <-r.doneCh:
-			break
+			return
 		}
 	}
 }
@@ -301,16 +394,25 @@ Start monitoring
 3. register an informer for router advertisement resource creation events
 */
 func (r *raLatencyBCC) startMonitoring() error {
-	var err error
 	r.cudnConnTimestamp = sync.Map{}
 
-	// TODO: create r.routeCh and a go thread that keeps polling the AWS Route Server for route changes. When a new route is detected, it is sent to the routeCh channel.
+	routeServer, err := newBCCRouteServerObserver(awsRegion, routeServerId)
+	if err != nil {
+		return err
+	}
+
+	// Start observer goroutine to poll AWS Route Server for route changes
+	routeCh := make(chan newRoute, 1000)
+
+	r.wg.Add(1)
+	go r.observerWorker(routeServer, routeCh)
 
 	// Start worker goroutines
 	for range workerCount {
 		r.wg.Add(1)
-		go r.worker()
+		go r.worker(routeCh)
 	}
+
 	log.Infof("Creating Router Advertisement latency watcher for %s", r.JobConfig.Name)
 	connector, err := k8sconnector.NewK8SConnector(r.RestConfig)
 	if err != nil {
@@ -339,6 +441,12 @@ func (r *raLatencyBCC) setInputVars() {
 			if err != nil {
 				log.Errorf("Failure parsing maxTimeout: %v", err)
 			}
+		}
+		if val, ok := obj.InputVars["awsRegion"]; ok {
+			awsRegion = val.(string)
+		}
+		if val, ok := obj.InputVars["routeServerId"]; ok {
+			routeServerId = val.(string)
 		}
 	}
 }
@@ -428,16 +536,16 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 	r.Metrics.Range(func(key, value any) bool {
 		m := value.(raMetricBCC)
 
-		/*for _, udn := range m.cudn {
-			_, exists := r.cudnConnTimestamp.Load(udn)
+		for _, udn := range m.cudn {
+			val, exists := r.cudnConnTimestamp.Load(udn)
 			if exists {
-				nlRouteVal := val.(netlinkRoutes)
-				for _, ts := range nlRouteVal.pingTimestamps {
+				routeVal := val.(detectedRoutes)
+				for _, ts := range routeVal.pingTimestamps {
 					m.Latency = append(m.Latency, float64(ts.Sub(m.Timestamp).Milliseconds()))
 				}
-				m.NetlinkRouteLatency = append(m.NetlinkRouteLatency, float64(nlRouteVal.routeTimestamp.Sub(m.Timestamp).Milliseconds()))
+				m.AwsRouteServerRouteLatency = append(m.AwsRouteServerRouteLatency, float64(routeVal.routeTimestamp.Sub(m.Timestamp).Milliseconds()))
 			}
-		}*/
+		}
 		// Index ping latency
 		latencySummary := metrics.NewLatencySummary(m.Latency, m.Name)
 		log.Tracef("%s: 50th: %d 95th: %d 99th: %d min: %d max: %d avg: %d\n", m.Name, latencySummary.P50, latencySummary.P95, latencySummary.P99, latencySummary.Min, latencySummary.Max, latencySummary.Avg)
