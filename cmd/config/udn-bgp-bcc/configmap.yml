@@ -3,6 +3,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{.JobName}}-{{.Replica}}
+  namespace: udn-bgp-{{.Iteration}}
 data:
   key1: "{{randAlphaNum 2048}}"
 

@@ -24,96 +24,35 @@ metricsEndpoints:
 {{ end }}
 jobs:
   - name: udn-bgp-bcc-create-namespaces
-    namespace: udn-bgp
     jobIterations: {{.JOB_ITERATIONS}}
-    qps: {{.QPS}}
-    burst: {{.BURST}}
-    namespacedIterations: true
-    waitWhenFinished: true
-    skipIndexing: true
-    jobPause: 1m
-    namespaceLabels:
-      security.openshift.io/scc.podSecurityLabelSync: false
-      pod-security.kubernetes.io/enforce: privileged
-      pod-security.kubernetes.io/audit: privileged
-      pod-security.kubernetes.io/warn: privileged
-      k8s.ovn.org/primary-user-defined-network: ""
-    objects:
-      - objectTemplate: configmap.yml
-        replicas: 1
-
-  - name: udn-bgp-bcc-create-cudn
-    {{- $numCudn := div .JOB_ITERATIONS .NAMESPACES_PER_CUDN }}
-    jobIterations: {{$numCudn}}
     qps: {{.QPS}}
     burst: {{.BURST}}
     namespacedIterations: false
     waitWhenFinished: true
-    jobPause: 15m
     skipIndexing: true
-    namespaceLabels:
-      security.openshift.io/scc.podSecurityLabelSync: false
-      pod-security.kubernetes.io/enforce: privileged
-      pod-security.kubernetes.io/audit: privileged
-      pod-security.kubernetes.io/warn: privileged
-      k8s.ovn.org/primary-user-defined-network: ""
+    jobPause: 30s
+    cleanup: false
     objects:
-      - objectTemplate: cudn.yml
+      - objectTemplate: namespace.yml
         replicas: 1
         inputVars:
           namespaces_per_cudn: {{.NAMESPACES_PER_CUDN}}
-          total_namespaces: {{.JOB_ITERATIONS}}
-          cidrs_per_cudn: {{.CIDRS_PER_CUDN}}
-          enable_vm: {{.ENABLE_VM}}
-          layer2: {{.LAYER2}}
+      - objectTemplate: configmap.yml
+        replicas: 1
 
-  - name: udn-bgp-bcc-create-pods
-    namespace: udn-bgp
-    jobIterations: {{.JOB_ITERATIONS}}
-    qps: {{.QPS}}
-    burst: {{.BURST}}
-    namespacedIterations: true
-    podWait: false
-    waitWhenFinished: true
-    preLoadImages: true
-    jobPause: 10m
-    cleanup: false
-    skipIndexing: true
-    namespaceLabels:
-      security.openshift.io/scc.podSecurityLabelSync: false
-      pod-security.kubernetes.io/enforce: privileged
-      pod-security.kubernetes.io/audit: privileged
-      pod-security.kubernetes.io/warn: privileged
-      k8s.ovn.org/primary-user-defined-network: ""
-    objects:
-    {{ if .ENABLE_VM }}
-      - objectTemplate: vm.yml
-        replicas: {{.CIDRS_PER_CUDN}}
-    {{ else }}
-      - objectTemplate: pod.yml
-        replicas: {{.CIDRS_PER_CUDN}}
-        inputVars:
-          podReplicas: 1
-    {{ end }}
-
-  - name: udn-bgp-bcc-route-advertisements
+  - name: udn-bgp-bcc-create-bgp-routing
     {{- $numCudn := div .JOB_ITERATIONS .NAMESPACES_PER_CUDN }}
     jobIterations: {{$numCudn}}
     qps: {{.QPS}}
     burst: {{.BURST}}
     namespacedIterations: false
     waitWhenFinished: true
-    namespaceLabels:
-      security.openshift.io/scc.podSecurityLabelSync: false
-      pod-security.kubernetes.io/enforce: privileged
-      pod-security.kubernetes.io/audit: privileged
-      pod-security.kubernetes.io/warn: privileged
-      k8s.ovn.org/primary-user-defined-network: ""
+    cleanup: false
     objects:
-      - objectTemplate: ra.yml
+      - objectTemplate: bgprouting.yml
         replicas: 1
         inputVars:
           maxTimeout: 10m
-          layer2: {{.LAYER2}}
           awsRegion: {{.AWS_REGION}}
           routeServerId: {{.ROUTE_SERVER_ID}}
+          cidrs_per_cudn: {{.CIDRS_PER_CUDN}}

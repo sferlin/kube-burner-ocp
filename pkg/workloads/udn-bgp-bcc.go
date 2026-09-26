@@ -15,12 +15,17 @@
 package workloads
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"time"
 
 	kubeburnermeasurements "github.com/kube-burner/kube-burner/v2/pkg/measurements"
 	"github.com/kube-burner/kube-burner/v2/pkg/workloads"
+	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/kube-burner/kube-burner-ocp/pkg/measurements"
 )
@@ -29,11 +34,41 @@ var additionalMeasurementFactoryMapBCC = map[string]kubeburnermeasurements.NewMe
 	"raLatencyBCC": measurements.NewRaLatencyBCCMeasurementFactory,
 }
 
+var (
+	bgpRoutingGVR = schema.GroupVersionResource{
+		Group:    "networking.openshift.io",
+		Version:  "v1beta1",
+		Resource: "bgproutings",
+	}
+)
+
+// cleanupBCCResources deletes BGP Cloud Connector resources in the correct order:
+// 1. BGPRouting CRs (automatically cleans up their managed CUDNs via finalizers and withdraws routes)
+// 2. Namespaces (cascade deletes pods and other namespaced resources)
+func cleanupBCCResources(ctx context.Context, labelSelector string) {
+	k8sConnector := getK8SConnector()
+
+	log.Infof("Cleaning up BGPRouting CRs with label: %s", labelSelector)
+	err := k8sConnector.DynamicClient().Resource(bgpRoutingGVR).DeleteCollection(
+		ctx,
+		metav1.DeleteOptions{},
+		metav1.ListOptions{LabelSelector: labelSelector},
+	)
+	if err != nil {
+		log.Warnf("Error deleting BGPRouting CRs: %v", err)
+	}
+
+	// Wait for BGPRouting finalizers to clean up CUDNs and for BGP routes to be withdrawn
+	time.Sleep(10 * time.Second)
+
+	log.Infof("Cleaning up namespaces with label: %s", labelSelector)
+	cleanupTestNamespaces(ctx, labelSelector)
+}
+
 // NewUdnBgpBCC creates the BGP Cloud Connector variant of the udn-bgp workload.
 // It currently only supports AWS VPC Route Server and watches it for route changes.
 func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 	var iterations, namespacePerCudn, cidrsPerCudn int
-	var enableVm, layer2 bool
 	var metricsProfiles []string
 	var awsRegion string
 	var routeServerID string
@@ -42,6 +77,10 @@ func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 		Use:   variant,
 		Short: fmt.Sprintf("Runs %v workload", variant),
 		PreRunE: func(cmd *cobra.Command, args []string) error {
+			// Clean up resources from previous runs in the correct order
+			ctx := context.Background()
+			cleanupBCCResources(ctx, "kube-burner.io/job")
+
 			if cidrsPerCudn < 1 {
 				return fmt.Errorf("--cidrs-per-cudn must be >= 1, got %d", cidrsPerCudn)
 			}
@@ -66,20 +105,21 @@ func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 			AdditionalVars["JOB_ITERATIONS"] = iterations
 			AdditionalVars["NAMESPACES_PER_CUDN"] = namespacePerCudn
 			AdditionalVars["CIDRS_PER_CUDN"] = cidrsPerCudn
-			AdditionalVars["ENABLE_VM"] = enableVm
-			AdditionalVars["LAYER2"] = layer2
 			AdditionalVars["AWS_REGION"] = awsRegion
 			AdditionalVars["ROUTE_SERVER_ID"] = routeServerID
 			wh.SetMeasurements(additionalMeasurementFactoryMapBCC)
 			rc = RunWorkload(cmd, wh, cmd.Name()+".yml")
 		},
 		PostRun: func(cmd *cobra.Command, args []string) {
+			// Clean up resources if GC is enabled
+			if SetVars["GC"] == "true" {
+				ctx := context.Background()
+				cleanupBCCResources(ctx, "kube-burner.io/job")
+			}
 			os.Exit(rc)
 		},
 	}
 	cmd.Flags().IntVar(&iterations, "iterations", 10, fmt.Sprintf("%v iterations", variant))
-	cmd.Flags().BoolVar(&enableVm, "vm", false, "Deploy a VM for the test instead of a pod")
-	cmd.Flags().BoolVar(&layer2, "layer2", false, "Use Layer2 topology for CUDNs instead of Layer3")
 	cmd.Flags().IntVar(&namespacePerCudn, "namespaces-per-cudn", 1, "Number of namespaces sharing the same cluster UDN")
 	cmd.Flags().IntVar(&cidrsPerCudn, "cidrs-per-cudn", 1, "Number of CIDRs per CUDN")
 	cmd.Flags().StringVar(&awsRegion, "aws-region", "", "AWS region containing the VPC Route Server")
