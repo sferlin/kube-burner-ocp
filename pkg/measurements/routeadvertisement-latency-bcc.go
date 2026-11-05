@@ -17,14 +17,13 @@ package measurements
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	k8sconnector "github.com/cloud-bulldozer/go-commons/v2/k8s-connector"
 	"github.com/kube-burner/kube-burner-ocp/pkg/utils"
 	"github.com/kube-burner/kube-burner/v2/pkg/config"
@@ -43,20 +42,21 @@ import (
 	"k8s.io/client-go/tools/cache"
 )
 
-// raLatencyBCC measures end-to-end latency for BGP Cloud Connector (BCC) route advertisement from OpenShift to AWS VPC.
-// It tracks seven timestamps (T0-T5) for each BGPRouting CR and its associated pod:
+// raLatencyBCC measures end-to-end latency for BGP Cloud Connector (BCC) route advertisement from OpenShift to cloud route servers.
+// Supports AWS VPC Route Server and Azure Route Server. It tracks up to seven timestamps (T0-T5) for each BGPRouting CR:
 //
 // T0: Subnet appears in the shared RouteAdvertisement spec.network.subnets[] list
 // T0.5: Subnet is marked as accepted in the shared RouteAdvertisement status
-// T1: Route appears in AWS Route Server RIB (Routing Information Base)
-// T2: Route becomes active in AWS Route Server FIB (Forwarding Information Base)
-// T3: Route appears in AWS VPC route table
+// T1: (AWS only) Route appears in Route Server RIB (Routing Information Base) - Azure Route Server doesn't expose RIB/FIB separation
+// T2: (AWS only) Route becomes active in Route Server FIB (Forwarding Information Base) - Azure Route Server doesn't expose RIB/FIB separation
+// T3: Route appears in cloud route table (VPC route table for AWS, route table for Azure)
 // T4: Pod receives its CUDN IP address and enters Running state
 // T5: Pod becomes network-reachable (first successful ICMP ping)
 //
 // Measurements are keyed by BGPRouting name and include per-subnet latencies along with
 // aggregated statistics (min, max, avg, p99) for each timestamp. The T5_SuccessfulPings
 // metric counts how many pods were successfully pinged (one per subnet).
+// Note: T1 and T2 are AWS-specific; Azure Route Server measurements will only populate T0, T0.5, T3-T5.
 const (
 	raLatencyBCCMeasurement          = "raLatencyBCCMeasurement"
 	raLatencyBCCQuantilesMeasurement = "raLatencyBCCQuantilesMeasurement"
@@ -64,13 +64,21 @@ const (
 )
 
 var (
-	maxTimeout           time.Duration = 1 * time.Minute
-	awsRegion            string
-	routeServerId        string
-	routesPollInterval   time.Duration = 250 * time.Millisecond
-	vpcId                string
-	vpcRoutePollInterval time.Duration = 250 * time.Millisecond
-	pingInterval         time.Duration = 100 * time.Millisecond
+	maxTimeout        time.Duration = 1 * time.Minute
+	cloudProvider     string
+	routePollInterval time.Duration = 250 * time.Millisecond
+	pingInterval      time.Duration = 100 * time.Millisecond
+
+	// AWS-specific variables
+	awsRegion     string
+	routeServerId string
+	vpcId         string
+
+	// Azure-specific variables
+	azureSubscriptionId  string
+	azureResourceGroup   string
+	azureRouteServerName string
+	azureNicResourceID   string
 
 	supportedRaLatencyBCCJobTypes = []config.JobType{config.CreationJob, config.PatchJob}
 
@@ -175,6 +183,7 @@ type networkStatus struct {
 type raLatencyBCC struct {
 	measurements.BaseMeasurement
 
+	routeProvider      utils.BCCRouteServerProvider
 	routeTimestamps    sync.Map // key: subnet, value: *detectedRoute
 	podTimestamps      sync.Map // key: subnet, value: *podMeasurement
 	detectedRouteCount uint64
@@ -354,7 +363,7 @@ type newRoute struct {
 	InFIB bool
 }
 
-func (r *raLatencyBCC) observerWorker(routeServer *utils.BCCRouteServerObserver, routeCh chan<- newRoute, baselineReadCh chan<- struct{}, vpcCheckCh chan<- struct{}) {
+func (r *raLatencyBCC) observerWorker(routeProvider utils.BCCRouteServerProvider, routeCh chan<- newRoute, baselineReadCh chan<- struct{}, routeTableCheckCh chan<- struct{}) {
 	defer r.wg.Done()
 
 	baselineRead := false
@@ -362,9 +371,9 @@ func (r *raLatencyBCC) observerWorker(routeServer *utils.BCCRouteServerObserver,
 	currentFibState := make(map[string]bool)
 
 	read := func() {
-		routes, err := routeServer.GetRoutes(context.Background())
+		routes, err := routeProvider.GetRoutes(context.Background())
 		if err != nil {
-			log.Warnf("BCC AWS Route Server query failed: %v", err)
+			log.Warnf("BCC Route Server query failed: %v", err)
 			return
 		}
 
@@ -373,8 +382,8 @@ func (r *raLatencyBCC) observerWorker(routeServer *utils.BCCRouteServerObserver,
 		fetchedFibState := make(map[string]bool)
 
 		for _, route := range routes {
-			subnetString := aws.ToString(route.Prefix)
-			inFIB := route.RouteStatus == ec2types.RouteServerRouteStatusInFib
+			subnetString := route.Prefix
+			inFIB := route.InFIB
 
 			fetchedSubnets[subnetString] = true
 			fetchedFibState[subnetString] = inFIB
@@ -398,9 +407,9 @@ func (r *raLatencyBCC) observerWorker(routeServer *utils.BCCRouteServerObserver,
 				log.Debugf("Route FIB state changed: %s now in-fib", subnetString)
 				routeCh <- newRoute{Dst: subnetString, Ts: now, InFIB: inFIB}
 
-				// Notify VPC worker to check immediately (non-blocking)
+				// Notify route table worker to check immediately (non-blocking)
 				select {
-				case vpcCheckCh <- struct{}{}:
+				case routeTableCheckCh <- struct{}{}:
 				default:
 				}
 			}
@@ -421,7 +430,7 @@ func (r *raLatencyBCC) observerWorker(routeServer *utils.BCCRouteServerObserver,
 	log.Debugf("Baseline read complete, monitoring for new routes...")
 	close(baselineReadCh)
 
-	ticker := time.NewTicker(routesPollInterval)
+	ticker := time.NewTicker(routePollInterval)
 	defer ticker.Stop()
 
 	for {
@@ -434,7 +443,7 @@ func (r *raLatencyBCC) observerWorker(routeServer *utils.BCCRouteServerObserver,
 	}
 }
 
-// worker records T1 (RIB) and T2 (FIB) timestamps as routes are advertised to AWS Route Server.
+// worker records T1 (RIB) and T2 (FIB) timestamps as routes are advertised to Route Server.
 func (r *raLatencyBCC) worker(routeCh <-chan newRoute) {
 	defer r.wg.Done()
 	for {
@@ -470,22 +479,24 @@ func (r *raLatencyBCC) worker(routeCh <-chan newRoute) {
 	}
 }
 
-// vpcRouteTableWorker detects T3 (route appears in VPC route table) by polling periodically and on demand.
-func (r *raLatencyBCC) vpcRouteTableWorker(routeServer *utils.BCCRouteServerObserver, vpcCheckCh <-chan struct{}) {
+// vpcRouteTableWorker detects T3 (route appears in route table) by polling periodically and on demand.
+func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerProvider, routeTableCheckCh <-chan struct{}, routeTableResourceID string) {
 	defer r.wg.Done()
 
-	ticker := time.NewTicker(vpcRoutePollInterval)
+	ticker := time.NewTicker(routePollInterval)
 	defer ticker.Stop()
 
-	checkVpc := func() {
-		// Collect all subnets that have T2 but not T3
+	checkRouteTable := func() {
+		// Collect all subnets that haven't been checked in route table yet.
+		// For AWS: check routes that are in FIB (T2 set).
+		// For Azure: check routes that are in effective routes (T2+T3 set).
 		var pendingSubnets []string
 		r.routeTimestamps.Range(func(key, value any) bool {
 			subnet := key.(string)
 			route := value.(*detectedRoute)
 
-			// Only check routes that are in FIB but not yet in VPC table
-			if !route.t2_FibTimestamp.IsZero() && route.t3_VpcTimestamp.IsZero() {
+			if route.t3_VpcTimestamp.IsZero() && (!route.t0_RAInSpec.IsZero() || !route.t0_5_RAAccepted.IsZero()) {
+				// Route was advertised and hasn't been checked in route table yet
 				pendingSubnets = append(pendingSubnets, subnet)
 			}
 			return true
@@ -496,13 +507,13 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeServer *utils.BCCRouteServerObse
 		}
 
 		// Single API call for all pending routes
-		found, err := routeServer.CheckVpcRouteTables(context.Background(), vpcId, pendingSubnets)
+		found, err := routeProvider.CheckRouteTables(context.Background(), routeTableResourceID, pendingSubnets)
 		if err != nil {
-			log.Warnf("VPC route table query failed: %v", err)
+			log.Warnf("route table query failed: %v", err)
 			return
 		}
 
-		// Update timestamps for routes found in VPC table
+		// Update timestamps for routes found in route table
 		now := time.Now().UTC()
 		for subnet, exists := range found {
 			if exists {
@@ -514,7 +525,7 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeServer *utils.BCCRouteServerObse
 				if route.t3_VpcTimestamp.IsZero() {
 					route.t3_VpcTimestamp = now
 					r.routeTimestamps.Store(subnet, route)
-					log.Debugf("T3: Route %s found in VPC route table at %v", subnet, now)
+					log.Debugf("T3: Route %s found in route table at %v", subnet, now)
 					atomic.AddUint64(&r.detectedRouteCount, 1)
 				}
 			}
@@ -524,44 +535,61 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeServer *utils.BCCRouteServerObse
 	for {
 		select {
 		case <-ticker.C:
-			checkVpc()
-		case <-vpcCheckCh:
+			checkRouteTable()
+		case <-routeTableCheckCh:
 			// Immediate check triggered by FIB state change
-			checkVpc()
+			checkRouteTable()
 		case <-r.doneCh:
 			return
 		}
 	}
 }
 
-// startMonitoring initializes AWS Route Server observers, VPC workers, and Kubernetes informers.
+// startMonitoring initializes cloud Route Server observers, route table workers, and Kubernetes informers.
 func (r *raLatencyBCC) startMonitoring() error {
 	r.routeTimestamps = sync.Map{}
 
-	routeServer, err := utils.NewBCCRouteServerObserver(awsRegion, routeServerId)
-	if err != nil {
-		log.Errorf("Failed to create route observer: %v", err)
-		return err
+	// Create cloud provider based on configuration
+	var routeProvider utils.BCCRouteServerProvider
+	var routeTableResourceID string
+	var err error
+
+	switch cloudProvider {
+	case "aws":
+		routeProvider, err = utils.NewBCCRouteServerObserver(awsRegion, routeServerId)
+		routeTableResourceID = vpcId
+		if err != nil {
+			return fmt.Errorf("failed to create Route Server provider: %w", err)
+		}
+	case "azure":
+		routeProvider, err = utils.NewAzureRouteServerProvider(azureSubscriptionId, azureResourceGroup, azureRouteServerName, azureNicResourceID)
+		routeTableResourceID = azureNicResourceID
+		if err != nil {
+			return fmt.Errorf("failed to create Route Server provider: %w", err)
+		}
+	default:
+		return fmt.Errorf("unsupported cloud provider: %s", cloudProvider)
 	}
 
-	// Start observer goroutine to poll AWS Route Server for route changes
+	r.routeProvider = routeProvider
+
+	// Start observer goroutine to poll Route Server for route changes
 	routeCh := make(chan newRoute, 1000)
 	baselineReadCh := make(chan struct{})
-	vpcCheckCh := make(chan struct{}, 100) // Buffered channel for VPC check notifications
+	routeTableCheckCh := make(chan struct{}, 100) // Buffered channel for route table check notifications
 
 	r.wg.Add(1)
-	go r.observerWorker(routeServer, routeCh, baselineReadCh, vpcCheckCh)
+	go r.observerWorker(routeProvider, routeCh, baselineReadCh, routeTableCheckCh)
 	<-baselineReadCh // wait for baseline read to complete before starting workers
 
-	// Start worker goroutine that may in the future do more than just record timestamps, e.g. validate routes in AWS Route Server
-	// (and then we could have more than one worker)
+	// Start worker goroutine that may in the future do more than just record timestamps
 	r.wg.Add(1)
 	go r.worker(routeCh)
 
-	// Start VPC route table worker (single worker for all routes)
-	log.Infof("Starting VPC route table worker for VPC: %s", vpcId)
+	// Start route table worker (single worker for all routes)
+	log.Infof("Starting route table worker")
 	r.wg.Add(1)
-	go r.vpcRouteTableWorker(routeServer, vpcCheckCh)
+	go r.vpcRouteTableWorker(routeProvider, routeTableCheckCh, routeTableResourceID)
 
 	// Initialize pod IP channel and start T4 ping worker
 	r.podIPCh = make(chan podIPNotification, 100)
@@ -878,6 +906,10 @@ func (r *raLatencyBCC) setInputVars() {
 				log.Errorf("Failure parsing maxTimeout: %v", err)
 			}
 		}
+		if val, ok := obj.InputVars["cloudProvider"]; ok {
+			cloudProvider = val.(string)
+		}
+		// AWS-specific variables
 		if val, ok := obj.InputVars["awsRegion"]; ok {
 			awsRegion = val.(string)
 		}
@@ -886,6 +918,19 @@ func (r *raLatencyBCC) setInputVars() {
 		}
 		if val, ok := obj.InputVars["vpcId"]; ok {
 			vpcId = val.(string)
+		}
+		// Azure-specific variables
+		if val, ok := obj.InputVars["azureSubscriptionId"]; ok {
+			azureSubscriptionId = val.(string)
+		}
+		if val, ok := obj.InputVars["azureResourceGroup"]; ok {
+			azureResourceGroup = val.(string)
+		}
+		if val, ok := obj.InputVars["azureRouteServerName"]; ok {
+			azureRouteServerName = val.(string)
+		}
+		if val, ok := obj.InputVars["azureNicResourceId"]; ok {
+			azureNicResourceID = val.(string)
 		}
 	}
 }
@@ -952,7 +997,7 @@ func (r *raLatencyBCC) Stop() error {
 		return true
 	})
 
-	log.Infof("Waiting for %d routes to be detected in AWS Route Server", desiredCount)
+	log.Infof("Waiting for %d routes to be detected in Route Server", desiredCount)
 	r.waitForCompletion(desiredCount)
 
 	close(r.doneCh)
@@ -965,7 +1010,7 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 	r.Metrics.Range(func(key, value any) bool {
 		m := value.(raMetricBCC)
 
-		// For each subnet advertised by this BGPRouting, check if we detected it in AWS
+		// For each subnet advertised by this BGPRouting, check if we detected it in the Route Server
 		for _, subnet := range m.Subnets {
 			val, exists := r.routeTimestamps.Load(subnet)
 			if !exists {
@@ -1011,13 +1056,13 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 				log.Warnf("BGPRouting %s advertised subnet %s but it was never detected in FIB", m.Name, subnet)
 			}
 
-			// Calculate T3 latency (VPC route table)
+			// Calculate T3 latency (route table)
 			if !routeVal.t3_VpcTimestamp.IsZero() {
 				latencyMs := float64(routeVal.t3_VpcTimestamp.Sub(m.Timestamp).Milliseconds())
 				m.T3_VpcRouteTableLatency = append(m.T3_VpcRouteTableLatency, latencyMs)
-				log.Debugf("T3: BGPRouting %s subnet %s VPC table latency: %.0f ms", m.Name, subnet, latencyMs)
+				log.Debugf("T3: BGPRouting %s subnet %s route table latency: %.0f ms", m.Name, subnet, latencyMs)
 			} else {
-				log.Warnf("BGPRouting %s advertised subnet %s but it was never detected in VPC route table", m.Name, subnet)
+				log.Warnf("BGPRouting %s advertised subnet %s but it was never detected in route table", m.Name, subnet)
 			}
 
 			// Calculate T4 and T5 latencies from pod measurements
@@ -1094,7 +1139,7 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 			m.T3_MaxLatency = t3Summary.Max
 			m.T3_AvgLatency = t3Summary.Avg
 			m.T3_P99Latency = t3Summary.P99
-			log.Infof("T3 (VPC) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
+			log.Infof("T3 (Route Table) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
 				m.Name, t3Summary.Min, t3Summary.Max, t3Summary.Avg, t3Summary.P99)
 		}
 
@@ -1150,7 +1195,7 @@ func (r *raLatencyBCC) getLatency(normLatency any) map[string]float64 {
 		"T2_MaxLatency": float64(raMetric.T2_MaxLatency),
 		"T2_AvgLatency": float64(raMetric.T2_AvgLatency),
 		"T2_P99Latency": float64(raMetric.T2_P99Latency),
-		// T3: VPC Route Table
+		// T3: Route Table
 		"T3_MinLatency": float64(raMetric.T3_MinLatency),
 		"T3_MaxLatency": float64(raMetric.T3_MaxLatency),
 		"T3_AvgLatency": float64(raMetric.T3_AvgLatency),

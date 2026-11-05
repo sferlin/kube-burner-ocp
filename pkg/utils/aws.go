@@ -22,16 +22,16 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
-	log "github.com/sirupsen/logrus"
 )
 
-// BCCRouteServerObserver provides methods to interact with AWS VPC Route Server
+// BCCRouteServerObserver provides methods to interact with AWS VPC Route Server.
+// It implements the BCCRouteServerProvider interface.
 type BCCRouteServerObserver struct {
 	client        *ec2.Client
 	routeServerID string
 }
 
-// NewBCCRouteServerObserver creates a new AWS Route Server observer
+// NewBCCRouteServerObserver creates a new AWS Route Server observer that implements BCCRouteServerProvider.
 func NewBCCRouteServerObserver(region, routeServerID string) (*BCCRouteServerObserver, error) {
 	if region == "" {
 		return nil, fmt.Errorf("AWS region is empty")
@@ -52,9 +52,9 @@ func NewBCCRouteServerObserver(region, routeServerID string) (*BCCRouteServerObs
 	}, nil
 }
 
-// GetRoutes retrieves all routes from the AWS Route Server routing database
-func (o *BCCRouteServerObserver) GetRoutes(ctx context.Context) ([]ec2types.RouteServerRoute, error) {
-	var routes []ec2types.RouteServerRoute
+// GetRoutes retrieves all routes from the AWS Route Server routing database and returns them as cloud-agnostic RouteInfo objects.
+func (o *BCCRouteServerObserver) GetRoutes(ctx context.Context) ([]RouteInfo, error) {
+	var awsRoutes []ec2types.RouteServerRoute
 	var nextToken *string
 
 	for {
@@ -72,7 +72,7 @@ func (o *BCCRouteServerObserver) GetRoutes(ctx context.Context) ([]ec2types.Rout
 			)
 		}
 
-		routes = append(routes, output.Routes...)
+		awsRoutes = append(awsRoutes, output.Routes...)
 
 		if output.NextToken == nil || aws.ToString(output.NextToken) == "" {
 			break
@@ -81,11 +81,22 @@ func (o *BCCRouteServerObserver) GetRoutes(ctx context.Context) ([]ec2types.Rout
 		nextToken = output.NextToken
 	}
 
+	// Convert AWS-specific types to cloud-agnostic RouteInfo
+	routes := make([]RouteInfo, len(awsRoutes))
+	for i, route := range awsRoutes {
+		routes[i] = RouteInfo{
+			Prefix: aws.ToString(route.Prefix),
+			InFIB:  route.RouteStatus == ec2types.RouteServerRouteStatusInFib,
+		}
+	}
+
 	return routes, nil
 }
 
-// CheckVpcRouteTables checks which subnets are present in VPC route tables
-func (o *BCCRouteServerObserver) CheckVpcRouteTables(ctx context.Context, vpcId string, subnets []string) (map[string]bool, error) {
+// CheckRouteTables checks which subnets are present in VPC route tables.
+// resourceID must be the VPC ID.
+func (o *BCCRouteServerObserver) CheckRouteTables(ctx context.Context, resourceID string, subnets []string) (map[string]bool, error) {
+	vpcId := resourceID
 	if vpcId == "" {
 		return nil, fmt.Errorf("VPC ID not configured")
 	}
@@ -123,32 +134,12 @@ func (o *BCCRouteServerObserver) CheckVpcRouteTables(ctx context.Context, vpcId 
 	return found, nil
 }
 
-// ValidateAWSConnectivity validates AWS credentials and connectivity to Route Server and VPC
+// ValidateAWSConnectivity validates AWS credentials and connectivity to Route Server and VPC route tables.
 func ValidateAWSConnectivity(region, routeServerID, vpcID string) error {
-	log.Infof("Validating AWS connectivity for region=%s, routeServerID=%s, vpcID=%s", region, routeServerID, vpcID)
-
 	observer, err := NewBCCRouteServerObserver(region, routeServerID)
 	if err != nil {
-		return fmt.Errorf("failed to create AWS observer: %w", err)
+		return fmt.Errorf("invalid AWS credentials or region (check credentials, region, and route-server-id): %w", err)
 	}
 
-	ctx := context.Background()
-
-	// Test Route Server connectivity
-	log.Infof("Testing Route Server API connectivity...")
-	routes, err := observer.GetRoutes(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to query Route Server routing database (check credentials, region, and route-server-id): %w", err)
-	}
-	log.Infof("Successfully connected to Route Server. Found %d baseline routes.", len(routes))
-
-	// Test VPC route table connectivity
-	log.Infof("Testing VPC route table API connectivity...")
-	_, err = observer.CheckVpcRouteTables(ctx, vpcID, []string{})
-	if err != nil {
-		return fmt.Errorf("failed to query VPC route tables (check vpc-id): %w", err)
-	}
-	log.Infof("Successfully connected to VPC route tables.")
-
-	return nil
+	return ValidateConnectivity("AWS", observer, vpcID)
 }

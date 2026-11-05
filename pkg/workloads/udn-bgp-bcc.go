@@ -67,13 +67,23 @@ func cleanupBCCResources(ctx context.Context, labelSelector string) {
 }
 
 // NewUdnBgpBCC creates the BGP Cloud Connector variant of the udn-bgp workload.
-// It currently only supports AWS VPC Route Server and watches it for route changes.
+// It supports AWS VPC Route Server and Azure Route Server.
 func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 	var iterations int
 	var metricsProfiles []string
+	var cloudProvider string
+
+	// AWS-specific variables
 	var awsRegion string
 	var routeServerID string
 	var vpcId string
+
+	// Azure-specific variables
+	var azureSubscriptionID string
+	var azureResourceGroup string
+	var azureRouteServerName string
+	var azureNicResourceID string
+
 	var rc int
 	cmd := &cobra.Command{
 		Use:   variant,
@@ -83,19 +93,28 @@ func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 			ctx := context.Background()
 			cleanupBCCResources(ctx, "kube-burner.io/job")
 
-			if routeServerID == "" {
-				return fmt.Errorf("--route-server-id is required")
-			}
-			if awsRegion == "" {
-				return fmt.Errorf("--aws-region is required")
-			}
-			if vpcId == "" {
-				return fmt.Errorf("--vpc-id is required")
+			// Validate cloud provider selection
+			if cloudProvider == "" {
+				return fmt.Errorf("--cloud-provider is required (aws or azure)")
 			}
 
-			// Validate AWS connectivity before starting the workload
-			if err := utils.ValidateAWSConnectivity(awsRegion, routeServerID, vpcId); err != nil {
-				return err
+			switch cloudProvider {
+			case "aws":
+				if routeServerID == "" || awsRegion == "" || vpcId == "" {
+					return fmt.Errorf("--route-server-id, --aws-region, and --vpc-id are required")
+				}
+				if err := utils.ValidateAWSConnectivity(awsRegion, routeServerID, vpcId); err != nil {
+					return err
+				}
+			case "azure":
+				if azureSubscriptionID == "" || azureResourceGroup == "" || azureRouteServerName == "" {
+					return fmt.Errorf("--azure-subscription-id, --azure-resource-group, and --azure-route-server-name are required")
+				}
+				if err := utils.ValidateAzureConnectivity(azureSubscriptionID, azureResourceGroup, azureRouteServerName); err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("unsupported cloud provider: %s (must be aws or azure)", cloudProvider)
 			}
 
 			return nil
@@ -103,9 +122,20 @@ func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 		Run: func(cmd *cobra.Command, args []string) {
 			setMetrics(cmd, metricsProfiles)
 			AdditionalVars["JOB_ITERATIONS"] = iterations
-			AdditionalVars["AWS_REGION"] = awsRegion
-			AdditionalVars["ROUTE_SERVER_ID"] = routeServerID
-			AdditionalVars["VPC_ID"] = vpcId
+			AdditionalVars["CLOUD_PROVIDER"] = cloudProvider
+
+			switch cloudProvider {
+			case "aws":
+				AdditionalVars["AWS_REGION"] = awsRegion
+				AdditionalVars["ROUTE_SERVER_ID"] = routeServerID
+				AdditionalVars["VPC_ID"] = vpcId
+			case "azure":
+				AdditionalVars["AZURE_SUBSCRIPTION_ID"] = azureSubscriptionID
+				AdditionalVars["AZURE_RESOURCE_GROUP"] = azureResourceGroup
+				AdditionalVars["AZURE_ROUTE_SERVER_NAME"] = azureRouteServerName
+				AdditionalVars["AZURE_NIC_RESOURCE_ID"] = azureNicResourceID
+			}
+
 			wh.SetMeasurements(additionalMeasurementFactoryMapBCC)
 			rc = RunWorkload(cmd, wh, cmd.Name()+".yml")
 		},
@@ -119,13 +149,20 @@ func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 		},
 	}
 	cmd.Flags().IntVar(&iterations, "iterations", 10, fmt.Sprintf("%v iterations", variant))
-	cmd.Flags().StringVar(&awsRegion, "aws-region", "", "AWS region containing the VPC Route Server")
-	cmd.Flags().StringVar(&routeServerID, "route-server-id", "", "AWS VPC Route Server ID")
-	cmd.Flags().StringVar(&vpcId, "vpc-id", "", "AWS VPC ID for route table verification (T3 measurement)")
 	cmd.Flags().StringSliceVar(&metricsProfiles, "metrics-profile", []string{"metrics.yml"}, "Comma separated list of metrics profiles to use")
-	cmd.MarkFlagRequired("iterations")
-	cmd.MarkFlagRequired("aws-region")
-	cmd.MarkFlagRequired("route-server-id")
-	cmd.MarkFlagRequired("vpc-id")
+	cmd.Flags().StringVar(&cloudProvider, "cloud-provider", "", "Cloud provider: aws or azure")
+	cmd.MarkFlagRequired("cloud-provider")
+
+	// AWS-specific flags
+	cmd.Flags().StringVar(&awsRegion, "aws-region", "", "[AWS] AWS region containing the Route Server")
+	cmd.Flags().StringVar(&routeServerID, "route-server-id", "", "[AWS] AWS Route Server ID")
+	cmd.Flags().StringVar(&vpcId, "vpc-id", "", "[AWS] AWS VPC ID for route table verification (T3 measurement)")
+
+	// Azure-specific flags
+	cmd.Flags().StringVar(&azureSubscriptionID, "azure-subscription-id", "", "[Azure] Azure subscription ID")
+	cmd.Flags().StringVar(&azureResourceGroup, "azure-resource-group", "", "[Azure] Azure resource group containing Route Server")
+	cmd.Flags().StringVar(&azureRouteServerName, "azure-route-server-name", "", "[Azure] Azure Route Server name")
+	cmd.Flags().StringVar(&azureNicResourceID, "azure-nic-resource-id", "", "[Azure] Route Server's NIC resource ID (format: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Network/networkInterfaces/{nic})")
+
 	return cmd
 }

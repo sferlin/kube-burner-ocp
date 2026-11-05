@@ -51,9 +51,17 @@ jobs:
         replicas: 1
         inputVars:
           maxTimeout: 10m
+          cloudProvider: {{.CLOUD_PROVIDER}}
+{{ if eq .CLOUD_PROVIDER "aws" }}
           awsRegion: {{.AWS_REGION}}
           routeServerId: {{.ROUTE_SERVER_ID}}
           vpcId: {{.VPC_ID}}
+{{ else if eq .CLOUD_PROVIDER "azure" }}
+          azureSubscriptionId: {{.AZURE_SUBSCRIPTION_ID}}
+          azureResourceGroup: {{.AZURE_RESOURCE_GROUP}}
+          azureRouteServerName: {{.AZURE_ROUTE_SERVER_NAME}}
+          azureNicResourceId: {{.AZURE_NIC_RESOURCE_ID}}
+{{ end }}
       - objectTemplate: pod.yml
         replicas: 1
         inputVars:
