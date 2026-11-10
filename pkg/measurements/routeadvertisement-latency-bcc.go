@@ -45,8 +45,8 @@ import (
 // raLatencyBCC measures end-to-end latency for BGP Cloud Connector (BCC) route advertisement from OpenShift to cloud route servers.
 // Supports AWS VPC Route Server and Azure Route Server. It tracks up to seven timestamps (T0-T5) for each BGPRouting CR:
 //
-// T0: Subnet appears in the shared RouteAdvertisement spec.network.subnets[] list
-// T0.5: Subnet is marked as accepted in the shared RouteAdvertisement status
+// T0: BGPRouting condition NetworkCreated becomes True (the BGP Cloud Connector created its CUDN)
+// T0.5: BGPRouting condition RouteAdvertisementsCreated becomes True (the shared RouteAdvertisements exist)
 // T1: Route appears in the Route Server RIB (AWS routing database / Azure BGP learned routes)
 // T2: Route becomes active for forwarding (AWS Route Server FIB / Azure NIC effective routes)
 // T3: Route appears in the cloud route table (AWS VPC route tables / effective routes of the first Azure BGP peer NIC)
@@ -63,6 +63,8 @@ const (
 	raLatencyBCCQuantilesMeasurement = "raLatencyBCCQuantilesMeasurement"
 	conditionStatusTrue              = "True"
 	cloudProviderAzure               = "azure"
+	conditionNetworkCreated          = "NetworkCreated"
+	conditionRACreated               = "RouteAdvertisementsCreated"
 )
 
 var (
@@ -88,12 +90,6 @@ var (
 		Version:  "v1beta1",
 		Resource: "bgproutings",
 	}
-
-	routeAdvertisementGVR = schema.GroupVersionResource{
-		Group:    "networking.openshift.io",
-		Version:  "v1beta1",
-		Resource: "routeadvertisements",
-	}
 )
 
 type raMetricBCC struct {
@@ -105,17 +101,17 @@ type raMetricBCC struct {
 	Metadata   any       `json:"metadata,omitempty"`
 	Subnets    []string  `json:"subnets"`
 
-	T0_RAInSpecLatency []float64 `json:"t0_raInSpecLatency,omitempty"`
-	T0_MinLatency      int       `json:"t0_minLatency,omitempty"`
-	T0_MaxLatency      int       `json:"t0_maxLatency,omitempty"`
-	T0_AvgLatency      int       `json:"t0_avgLatency,omitempty"`
-	T0_P99Latency      int       `json:"t0_p99Latency,omitempty"`
+	T0_NetworkCreatedLatency []float64 `json:"t0_networkCreatedLatency,omitempty"`
+	T0_MinLatency            int       `json:"t0_minLatency,omitempty"`
+	T0_MaxLatency            int       `json:"t0_maxLatency,omitempty"`
+	T0_AvgLatency            int       `json:"t0_avgLatency,omitempty"`
+	T0_P99Latency            int       `json:"t0_p99Latency,omitempty"`
 
-	T0_5_RAAcceptedLatency []float64 `json:"t0_5_raAcceptedLatency,omitempty"`
-	T0_5_MinLatency        int       `json:"t0_5_minLatency,omitempty"`
-	T0_5_MaxLatency        int       `json:"t0_5_maxLatency,omitempty"`
-	T0_5_AvgLatency        int       `json:"t0_5_avgLatency,omitempty"`
-	T0_5_P99Latency        int       `json:"t0_5_p99Latency,omitempty"`
+	T0_5_RACreatedLatency []float64 `json:"t0_5_raCreatedLatency,omitempty"`
+	T0_5_MinLatency       int       `json:"t0_5_minLatency,omitempty"`
+	T0_5_MaxLatency       int       `json:"t0_5_maxLatency,omitempty"`
+	T0_5_AvgLatency       int       `json:"t0_5_avgLatency,omitempty"`
+	T0_5_P99Latency       int       `json:"t0_5_p99Latency,omitempty"`
 
 	T1_RibLatency []float64 `json:"t1_ribLatency,omitempty"`
 	T1_MinLatency int       `json:"t1_minLatency,omitempty"`
@@ -157,13 +153,13 @@ type raMetricBCC struct {
 
 // detectedRoute holds route detection timestamps for each subnet.
 type detectedRoute struct {
-	subnet          string
-	t0_RAInSpec     time.Time
-	t0_5_RAAccepted time.Time
-	t1_RibTimestamp time.Time
-	t2_FibTimestamp time.Time
-	t3_VpcTimestamp time.Time
-	t3_5_AllPeers   time.Time
+	subnet            string
+	t0_NetworkCreated time.Time
+	t0_5_RACreated    time.Time
+	t1_RibTimestamp   time.Time
+	t2_FibTimestamp   time.Time
+	t3_VpcTimestamp   time.Time
+	t3_5_AllPeers     time.Time
 }
 
 // podMeasurement holds pod lifecycle timestamps.
@@ -241,128 +237,55 @@ func (r *raLatencyBCC) handleAdd(obj any) {
 	log.Debugf("BGPRouting %s (Subnets: %v) created at %v", bgpRoutingName, subnetsRaw, t.UTC())
 
 	r.Metrics.LoadOrStore(bgpRoutingName, raMetricBCC{
-		Name:                    bgpRoutingName,
-		Timestamp:               t.UTC(),
-		Subnets:                 subnetsRaw,
-		T0_RAInSpecLatency:      []float64{},
-		T0_5_RAAcceptedLatency:  []float64{},
-		T1_RibLatency:           []float64{},
-		T2_FibLatency:           []float64{},
-		T3_VpcRouteTableLatency: []float64{},
-		T3_5_AllPeersLatency:    []float64{},
-		T4_PodIPAssignedLatency: []float64{},
-		T5_PingSuccessLatency:   []float64{},
-		MetricName:              raLatencyBCCMeasurement,
-		UUID:                    r.Uuid,
-		Metadata:                r.Metadata,
-		JobName:                 r.JobConfig.Name,
+		Name:                     bgpRoutingName,
+		Timestamp:                t.UTC(),
+		Subnets:                  subnetsRaw,
+		T0_NetworkCreatedLatency: []float64{},
+		T0_5_RACreatedLatency:    []float64{},
+		T1_RibLatency:            []float64{},
+		T2_FibLatency:            []float64{},
+		T3_VpcRouteTableLatency:  []float64{},
+		T3_5_AllPeersLatency:     []float64{},
+		T4_PodIPAssignedLatency:  []float64{},
+		T5_PingSuccessLatency:    []float64{},
+		MetricName:               raLatencyBCCMeasurement,
+		UUID:                     r.Uuid,
+		Metadata:                 r.Metadata,
+		JobName:                  r.JobConfig.Name,
 	})
 }
 
-// handleRAUpdate tracks when subnets appear in the shared RouteAdvertisement spec and status.
-// T0: Subnet appears in spec.network.subnets[]
-// T0.5: Subnet appears in status.acceptedSubnets[] or has Accepted condition
-func (r *raLatencyBCC) handleRAUpdate(oldObj, newObj any) {
-	newRA := newObj.(*unstructured.Unstructured)
-	oldRA := oldObj.(*unstructured.Unstructured)
-
-	raName, _, _ := unstructured.NestedString(newRA.UnstructuredContent(), "metadata", "name")
+// handleBGPRoutingUpdate records T0 and T0.5 for the BGPRouting's subnets when the BGP Cloud Connector
+// sets the NetworkCreated and RouteAdvertisementsCreated conditions to True.
+func (r *raLatencyBCC) handleBGPRoutingUpdate(_, newObj any) {
+	bgpRouting := newObj.(*unstructured.Unstructured)
+	subnets, _, _ := unstructured.NestedStringSlice(bgpRouting.UnstructuredContent(), "spec", "network", "subnets")
+	conditions, _, _ := unstructured.NestedSlice(bgpRouting.UnstructuredContent(), "status", "conditions")
 	now := time.Now().UTC()
 
-	// Extract subnet lists from spec.network.subnets
-	newSubnets, newFound, _ := unstructured.NestedStringSlice(newRA.UnstructuredContent(), "spec", "network", "subnets")
-	oldSubnets, oldFound, _ := unstructured.NestedStringSlice(oldRA.UnstructuredContent(), "spec", "network", "subnets")
-
-	if !newFound {
-		newSubnets = []string{}
-	}
-	if !oldFound {
-		oldSubnets = []string{}
-	}
-
-	// T0: Detect newly added subnets in spec
-	for _, subnet := range newSubnets {
-		if !containsSubnet(oldSubnets, subnet) {
-			// This subnet was just added to the shared RA spec
-			val, loaded := r.routeTimestamps.LoadOrStore(subnet, &detectedRoute{subnet: subnet})
+	for _, c := range conditions {
+		cond, ok := c.(map[string]any)
+		if !ok || cond["status"] != conditionStatusTrue {
+			continue
+		}
+		for _, subnet := range subnets {
+			val, _ := r.routeTimestamps.LoadOrStore(subnet, &detectedRoute{subnet: subnet})
 			route := val.(*detectedRoute)
-
-			// Only record T0 once (first time we see this subnet in spec)
-			if !loaded || route.t0_RAInSpec.IsZero() {
-				route.t0_RAInSpec = now
-				r.routeTimestamps.Store(subnet, route)
-				log.Debugf("T0: Subnet %s added to shared RA %s spec at %v", subnet, raName, now)
-			}
-		}
-	}
-
-	// T0.5: Check status for accepted subnets
-	// Try multiple possible status structures since the API may vary:
-
-	// Option 1: status.acceptedSubnets[] list
-	acceptedSubnets, acceptedFound, _ := unstructured.NestedStringSlice(newRA.UnstructuredContent(), "status", "acceptedSubnets")
-	if acceptedFound {
-		for _, subnet := range acceptedSubnets {
-			val, ok := r.routeTimestamps.Load(subnet)
-			if ok {
-				route := val.(*detectedRoute)
-				if route.t0_5_RAAccepted.IsZero() {
-					route.t0_5_RAAccepted = now
-					r.routeTimestamps.Store(subnet, route)
-					log.Debugf("T0.5: Subnet %s accepted in shared RA %s at %v", subnet, raName, now)
+			switch cond["type"] {
+			case conditionNetworkCreated:
+				if route.t0_NetworkCreated.IsZero() {
+					route.t0_NetworkCreated = now
+					log.Debugf("T0: Network for subnet %s created at %v", subnet, now)
+				}
+			case conditionRACreated:
+				if route.t0_5_RACreated.IsZero() {
+					route.t0_5_RACreated = now
+					log.Debugf("T0.5: RouteAdvertisements for subnet %s created at %v", subnet, now)
 				}
 			}
-		}
-		return
-	}
-
-	// Option 2: status.conditions with Accepted=True (all-or-nothing acceptance)
-	conditions, condFound, _ := unstructured.NestedSlice(newRA.UnstructuredContent(), "status", "conditions")
-	if condFound {
-		for _, cond := range conditions {
-			condMap, ok := cond.(map[string]interface{})
-			if !ok {
-				continue
-			}
-
-			condType, _, _ := unstructured.NestedString(condMap, "type")
-			status, _, _ := unstructured.NestedString(condMap, "status")
-
-			if (condType == "Accepted" || condType == "Ready") && status == conditionStatusTrue {
-				lastTransitionTime, _, _ := unstructured.NestedString(condMap, "lastTransitionTime")
-				acceptedTime, err := time.Parse(time.RFC3339, lastTransitionTime)
-				if err != nil {
-					acceptedTime = now
-				} else {
-					acceptedTime = acceptedTime.UTC()
-				}
-
-				// Mark all subnets in spec as accepted at this time
-				for _, subnet := range newSubnets {
-					val, ok := r.routeTimestamps.Load(subnet)
-					if ok {
-						route := val.(*detectedRoute)
-						if route.t0_5_RAAccepted.IsZero() {
-							route.t0_5_RAAccepted = acceptedTime
-							r.routeTimestamps.Store(subnet, route)
-							log.Debugf("T0.5: Subnet %s accepted (via RA %s condition) at %v", subnet, raName, acceptedTime)
-						}
-					}
-				}
-				break
-			}
+			r.routeTimestamps.Store(subnet, route)
 		}
 	}
-}
-
-// containsSubnet checks if a subnet exists in a slice.
-func containsSubnet(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
 }
 
 type newRoute struct {
@@ -464,11 +387,11 @@ func (r *raLatencyBCC) worker(routeCh <-chan newRoute) {
 			subnet := update.Dst
 			now := update.Ts
 
-			val, loaded := r.routeTimestamps.LoadOrStore(subnet, &detectedRoute{subnet: subnet})
+			val, _ := r.routeTimestamps.LoadOrStore(subnet, &detectedRoute{subnet: subnet})
 			route := val.(*detectedRoute)
 
 			// T1: Route first appears in RIB
-			if !loaded && route.t1_RibTimestamp.IsZero() {
+			if route.t1_RibTimestamp.IsZero() {
 				route.t1_RibTimestamp = now
 				log.Debugf("T1: Route %s in RIB at %v", subnet, now)
 			}
@@ -616,7 +539,7 @@ func (r *raLatencyBCC) startMonitoring() error {
 	go r.t4PingWorker()
 	log.Infof("Started T4 ping worker")
 
-	log.Infof("Creating RouteAdvertisement, BGPRouting and Pod watchers for %s", r.JobConfig.Name)
+	log.Infof("Creating BGPRouting and Pod watchers for %s", r.JobConfig.Name)
 	connector, err := k8sconnector.NewK8SConnector(r.RestConfig)
 	if err != nil {
 		log.Error(err)
@@ -624,32 +547,12 @@ func (r *raLatencyBCC) startMonitoring() error {
 	}
 	r.connector = connector
 
-	// RouteAdvertisement informer (watches the shared RA for T0 and T0.5 timestamps)
-	// This is optional - if it fails, we continue without T0/T0.5 measurements
-	raFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(r.connector.DynamicClient(), time.Minute, metav1.NamespaceAll, nil)
-	raInformer := raFactory.ForResource(routeAdvertisementGVR).Informer()
-	raInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		UpdateFunc: r.handleRAUpdate,
-	})
-
-	raStopCh := make(chan struct{})
-	raFactory.Start(raStopCh)
-
-	// Don't wait for sync or check errors - if RA doesn't exist, T0/T0.5 will just be missing
-	// This ensures the existing T1-T5 measurements still work even if RouteAdvertisement CRD is absent
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if !cache.WaitForCacheSync(ctx.Done(), raInformer.HasSynced) {
-		log.Warnf("RouteAdvertisement informer failed to sync - T0/T0.5 measurements will be unavailable")
-	} else {
-		log.Infof("RouteAdvertisement informer synced successfully")
-	}
-
-	// BGPRouting informer
+	// BGPRouting informer: creation timestamp, plus T0/T0.5 from status conditions
 	bgpRoutingFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(r.connector.DynamicClient(), time.Minute, metav1.NamespaceAll, nil)
 	bgpRoutingInformer := bgpRoutingFactory.ForResource(bgpRoutingGVR).Informer()
 	bgpRoutingInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: r.handleAdd,
+		AddFunc:    r.handleAdd,
+		UpdateFunc: r.handleBGPRoutingUpdate,
 	})
 
 	stopCh := make(chan struct{})
@@ -1037,22 +940,22 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 
 			routeVal := val.(*detectedRoute)
 
-			// Calculate T0 latency (RA in spec)
-			if !routeVal.t0_RAInSpec.IsZero() {
-				latencyMs := float64(routeVal.t0_RAInSpec.Sub(m.Timestamp).Milliseconds())
-				m.T0_RAInSpecLatency = append(m.T0_RAInSpecLatency, latencyMs)
-				log.Debugf("T0: BGPRouting %s subnet %s RA in spec latency: %.0f ms", m.Name, subnet, latencyMs)
+			// Calculate T0 latency (CUDN created)
+			if !routeVal.t0_NetworkCreated.IsZero() {
+				latencyMs := float64(routeVal.t0_NetworkCreated.Sub(m.Timestamp).Milliseconds())
+				m.T0_NetworkCreatedLatency = append(m.T0_NetworkCreatedLatency, latencyMs)
+				log.Debugf("T0: BGPRouting %s subnet %s network created latency: %.0f ms", m.Name, subnet, latencyMs)
 			} else {
-				log.Debugf("BGPRouting %s advertised subnet %s but it never appeared in shared RA spec (T0 unavailable)", m.Name, subnet)
+				log.Debugf("BGPRouting %s advertised subnet %s but NetworkCreated was never observed (T0 unavailable)", m.Name, subnet)
 			}
 
-			// Calculate T0.5 latency (RA accepted)
-			if !routeVal.t0_5_RAAccepted.IsZero() {
-				latencyMs := float64(routeVal.t0_5_RAAccepted.Sub(m.Timestamp).Milliseconds())
-				m.T0_5_RAAcceptedLatency = append(m.T0_5_RAAcceptedLatency, latencyMs)
-				log.Debugf("T0.5: BGPRouting %s subnet %s RA accepted latency: %.0f ms", m.Name, subnet, latencyMs)
+			// Calculate T0.5 latency (RouteAdvertisements created)
+			if !routeVal.t0_5_RACreated.IsZero() {
+				latencyMs := float64(routeVal.t0_5_RACreated.Sub(m.Timestamp).Milliseconds())
+				m.T0_5_RACreatedLatency = append(m.T0_5_RACreatedLatency, latencyMs)
+				log.Debugf("T0.5: BGPRouting %s subnet %s RouteAdvertisements created latency: %.0f ms", m.Name, subnet, latencyMs)
 			} else {
-				log.Debugf("BGPRouting %s advertised subnet %s but it was never accepted in shared RA (T0.5 unavailable)", m.Name, subnet)
+				log.Debugf("BGPRouting %s advertised subnet %s but RouteAdvertisementsCreated was never observed (T0.5 unavailable)", m.Name, subnet)
 			}
 
 			// Calculate T1 latency (RIB)
@@ -1115,24 +1018,24 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 		}
 
 		// Calculate T0 statistics
-		if len(m.T0_RAInSpecLatency) > 0 {
-			t0Summary := metrics.NewLatencySummary(m.T0_RAInSpecLatency, m.Name+"-T0")
+		if len(m.T0_NetworkCreatedLatency) > 0 {
+			t0Summary := metrics.NewLatencySummary(m.T0_NetworkCreatedLatency, m.Name+"-T0")
 			m.T0_MinLatency = t0Summary.Min
 			m.T0_MaxLatency = t0Summary.Max
 			m.T0_AvgLatency = t0Summary.Avg
 			m.T0_P99Latency = t0Summary.P99
-			log.Debugf("T0 (RA in Spec) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
+			log.Debugf("T0 (Network Created) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
 				m.Name, t0Summary.Min, t0Summary.Max, t0Summary.Avg, t0Summary.P99)
 		}
 
 		// Calculate T0.5 statistics
-		if len(m.T0_5_RAAcceptedLatency) > 0 {
-			t05Summary := metrics.NewLatencySummary(m.T0_5_RAAcceptedLatency, m.Name+"-T0.5")
+		if len(m.T0_5_RACreatedLatency) > 0 {
+			t05Summary := metrics.NewLatencySummary(m.T0_5_RACreatedLatency, m.Name+"-T0.5")
 			m.T0_5_MinLatency = t05Summary.Min
 			m.T0_5_MaxLatency = t05Summary.Max
 			m.T0_5_AvgLatency = t05Summary.Avg
 			m.T0_5_P99Latency = t05Summary.P99
-			log.Debugf("T0.5 (RA Accepted) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
+			log.Debugf("T0.5 (RouteAdvertisements Created) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
 				m.Name, t05Summary.Min, t05Summary.Max, t05Summary.Avg, t05Summary.P99)
 		}
 
@@ -1222,8 +1125,8 @@ func (r *raLatencyBCC) getLatency(normLatency any) map[string]float64 {
 			latencies[name] = float64(avg)
 		}
 	}
-	add("T0", m.T0_RAInSpecLatency, m.T0_AvgLatency)
-	add("T0_5", m.T0_5_RAAcceptedLatency, m.T0_5_AvgLatency)
+	add("T0", m.T0_NetworkCreatedLatency, m.T0_AvgLatency)
+	add("T0_5", m.T0_5_RACreatedLatency, m.T0_5_AvgLatency)
 	add("T1", m.T1_RibLatency, m.T1_AvgLatency)
 	add("T2", m.T2_FibLatency, m.T2_AvgLatency)
 	add("T3", m.T3_VpcRouteTableLatency, m.T3_AvgLatency)
