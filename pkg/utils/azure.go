@@ -17,6 +17,7 @@ package utils
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
@@ -57,13 +58,18 @@ func NewAzureRouteServerProvider(subscriptionID, routeServerRG, routeServerName 
 		return nil, fmt.Errorf("unable to create Azure network interfaces client: %w", err)
 	}
 
+	ipConfigClient, err := armnetwork.NewVirtualHubIPConfigurationClient(subscriptionID, cred, nil)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create Azure route server IP configuration client: %w", err)
+	}
+
 	p := &AzureRouteServerProvider{
 		bgpClient:       bgpClient,
 		nicClient:       nicClient,
 		routeServerName: routeServerName,
 		routeServerRG:   routeServerRG,
 	}
-	if p.peerNICs, err = p.discoverPeerNICs(context.Background()); err != nil {
+	if p.peerNICs, err = p.discoverPeerNICs(context.Background(), ipConfigClient); err != nil {
 		return nil, err
 	}
 	for _, nic := range p.peerNICs {
@@ -73,29 +79,81 @@ func NewAzureRouteServerProvider(subscriptionID, routeServerRG, routeServerName 
 	return p, nil
 }
 
-// discoverPeerNICs maps each BGP peer IP of the Route Server to the NIC holding that private IP.
-func (p *AzureRouteServerProvider) discoverPeerNICs(ctx context.Context) ([]*arm.ResourceID, error) {
-	peerIPs := map[string]bool{}
-	connPager := p.bgpClient.NewListPager(p.routeServerRG, p.routeServerName, nil)
-	for connPager.More() {
-		page, err := connPager.NextPage(ctx)
+// discoverPeerNICs maps each BGP peer IP of the Route Server to the NIC holding that private IP
+// in the Route Server's VNet. Private IPs are only unique within a VNet.
+func (p *AzureRouteServerProvider) discoverPeerNICs(ctx context.Context, ipConfigClient *armnetwork.VirtualHubIPConfigurationClient) ([]*arm.ResourceID, error) {
+	vnet, err := p.routeServerVNet(ctx, ipConfigClient)
+	if err != nil {
+		return nil, err
+	}
+	peerIPs, err := p.peerIPs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	nicsByIP, err := p.nicsByIP(ctx, vnet, peerIPs)
+	if err != nil {
+		return nil, err
+	}
+
+	var nics []*arm.ResourceID
+	for ip := range peerIPs {
+		ids := nicsByIP[ip]
+		if len(ids) != 1 {
+			return nil, fmt.Errorf("BGP peer IP %s must match exactly one NIC in VNet %s, found %d: %v", ip, vnet, len(ids), ids)
+		}
+		nic, err := arm.ParseResourceID(ids[0])
+		if err != nil {
+			return nil, fmt.Errorf("invalid NIC resource ID %q: %w", ids[0], err)
+		}
+		nics = append(nics, nic)
+	}
+	return nics, nil
+}
+
+// routeServerVNet returns the VNet the Route Server is deployed in, taken from its IP configuration subnet.
+func (p *AzureRouteServerProvider) routeServerVNet(ctx context.Context, ipConfigClient *armnetwork.VirtualHubIPConfigurationClient) (string, error) {
+	pager := ipConfigClient.NewListPager(p.routeServerRG, p.routeServerName, nil)
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
+		if err != nil {
+			return "", fmt.Errorf("failed to read route server IP configuration: %w", err)
+		}
+		for _, ipConfig := range page.Value {
+			if ipConfig != nil && ipConfig.Properties != nil && ipConfig.Properties.Subnet != nil && ipConfig.Properties.Subnet.ID != nil {
+				return vnetOf(*ipConfig.Properties.Subnet.ID), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("could not determine the VNet of route server %s", p.routeServerName)
+}
+
+// peerIPs returns the IPs of the Route Server's BGP peers.
+func (p *AzureRouteServerProvider) peerIPs(ctx context.Context) (map[string]bool, error) {
+	ips := map[string]bool{}
+	pager := p.bgpClient.NewListPager(p.routeServerRG, p.routeServerName, nil)
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list BGP connections: %w", err)
 		}
 		for _, conn := range page.Value {
 			if conn != nil && conn.Properties != nil && conn.Properties.PeerIP != nil {
-				peerIPs[*conn.Properties.PeerIP] = true
+				ips[*conn.Properties.PeerIP] = true
 			}
 		}
 	}
-	if len(peerIPs) == 0 {
+	if len(ips) == 0 {
 		return nil, fmt.Errorf("route server %s has no BGP peers", p.routeServerName)
 	}
+	return ips, nil
+}
 
-	nicsByIP := map[string][]string{}
-	nicPager := p.nicClient.NewListAllPager(nil)
-	for nicPager.More() {
-		page, err := nicPager.NextPage(ctx)
+// nicsByIP returns the IDs of the NICs in vnet that hold one of the given private IPs, keyed by IP.
+func (p *AzureRouteServerProvider) nicsByIP(ctx context.Context, vnet string, ips map[string]bool) (map[string][]string, error) {
+	nics := map[string][]string{}
+	pager := p.nicClient.NewListAllPager(nil)
+	for pager.More() {
+		page, err := pager.NextPage(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list network interfaces: %w", err)
 		}
@@ -104,30 +162,27 @@ func (p *AzureRouteServerProvider) discoverPeerNICs(ctx context.Context) ([]*arm
 				continue
 			}
 			for _, ipConfig := range nic.Properties.IPConfigurations {
-				if ipConfig == nil || ipConfig.Properties == nil || ipConfig.Properties.PrivateIPAddress == nil {
+				if ipConfig == nil || ipConfig.Properties == nil || ipConfig.Properties.PrivateIPAddress == nil ||
+					ipConfig.Properties.Subnet == nil || ipConfig.Properties.Subnet.ID == nil {
 					continue
 				}
-				if ip := *ipConfig.Properties.PrivateIPAddress; peerIPs[ip] {
-					nicsByIP[ip] = append(nicsByIP[ip], *nic.ID)
+				ip := *ipConfig.Properties.PrivateIPAddress
+				if ips[ip] && vnetOf(*ipConfig.Properties.Subnet.ID) == vnet {
+					nics[ip] = append(nics[ip], *nic.ID)
 				}
 			}
 		}
 	}
-
-	var nics []*arm.ResourceID
-	for ip := range peerIPs {
-		ids := nicsByIP[ip]
-		if len(ids) != 1 {
-			return nil, fmt.Errorf("BGP peer IP %s must match exactly one NIC in the subscription, found %d: %v", ip, len(ids), ids)
-		}
-		nic, err := arm.ParseResourceID(ids[0])
-		if err != nil {
-			return nil, fmt.Errorf("invalid NIC resource ID %q: %w", ids[0], err)
-		}
-		nics = append(nics, nic)
-	}
-
 	return nics, nil
+}
+
+// vnetOf returns the lower-cased VNet resource ID of a subnet resource ID.
+func vnetOf(subnetID string) string {
+	id := strings.ToLower(subnetID)
+	if i := strings.Index(id, "/subnets/"); i >= 0 {
+		return id[:i]
+	}
+	return id
 }
 
 // GetRoutes returns the routes learned by the Route Server from all of its BGP peers (T1).
