@@ -487,16 +487,14 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerPro
 	defer ticker.Stop()
 
 	checkRouteTable := func() {
-		// Collect all subnets that haven't been checked in route table yet.
-		// For AWS: check routes that are in FIB (T2 set).
-		// For Azure: check routes that are in effective routes (T2+T3 set).
+		// Collect subnets not yet found in the route table. AWS only checks routes already in FIB (T2);
+		// Azure exposes no FIB state, so every tracked route is checked.
 		var pendingSubnets []string
 		r.routeTimestamps.Range(func(key, value any) bool {
 			subnet := key.(string)
 			route := value.(*detectedRoute)
 
-			if route.t3_VpcTimestamp.IsZero() && (!route.t0_RAInSpec.IsZero() || !route.t0_5_RAAccepted.IsZero()) {
-				// Route was advertised and hasn't been checked in route table yet
+			if route.t3_VpcTimestamp.IsZero() && (!route.t2_FibTimestamp.IsZero() || cloudProvider == "azure") {
 				pendingSubnets = append(pendingSubnets, subnet)
 			}
 			return true

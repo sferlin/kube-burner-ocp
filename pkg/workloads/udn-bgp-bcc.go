@@ -93,11 +93,6 @@ func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 			ctx := context.Background()
 			cleanupBCCResources(ctx, "kube-burner.io/job")
 
-			// Validate cloud provider selection
-			if cloudProvider == "" {
-				return fmt.Errorf("--cloud-provider is required (aws or azure)")
-			}
-
 			switch cloudProvider {
 			case "aws":
 				if routeServerID == "" || awsRegion == "" || vpcId == "" {
@@ -150,8 +145,8 @@ func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 	}
 	cmd.Flags().IntVar(&iterations, "iterations", 10, fmt.Sprintf("%v iterations", variant))
 	cmd.Flags().StringSliceVar(&metricsProfiles, "metrics-profile", []string{"metrics.yml"}, "Comma separated list of metrics profiles to use")
-	cmd.Flags().StringVar(&cloudProvider, "cloud-provider", "", "Cloud provider: aws or azure")
-	cmd.MarkFlagRequired("cloud-provider")
+	cmd.Flags().StringVar(&cloudProvider, "cloud-provider", "aws", "Cloud provider: aws or azure")
+	cmd.MarkFlagRequired("iterations")
 
 	// AWS-specific flags
 	cmd.Flags().StringVar(&awsRegion, "aws-region", "", "[AWS] AWS region containing the Route Server")
