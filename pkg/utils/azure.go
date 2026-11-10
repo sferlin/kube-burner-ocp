@@ -192,43 +192,64 @@ func vnetOf(subnetID string) string {
 }
 
 // GetRoutes returns the routes learned by the Route Server from all of its BGP peers (T1).
+// Each peer's learned routes are a separate long-running operation, so all peers are queried in parallel.
 func (p *AzureRouteServerProvider) GetRoutes(ctx context.Context) ([]RouteInfo, error) {
-	var routes []RouteInfo
-
+	var peers []string
 	connPager := p.bgpClient.NewListPager(p.routeServerRG, p.routeServerName, nil)
 	for connPager.More() {
 		connPage, err := connPager.NextPage(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list BGP connections: %w", err)
 		}
-
 		for _, conn := range connPage.Value {
-			if conn == nil || conn.Name == nil {
-				continue
-			}
-
-			poller, err := p.bgpClient.BeginListLearnedRoutes(ctx, p.routeServerRG, p.routeServerName, *conn.Name, nil)
-			if err != nil {
-				log.Warnf("failed to query learned routes from peer %s: %v", *conn.Name, err)
-				continue
-			}
-			res, err := poller.PollUntilDone(ctx, nil)
-			if err != nil {
-				log.Warnf("failed to poll learned routes from peer %s: %v", *conn.Name, err)
-				continue
-			}
-
-			// Value maps each virtual router instance to the routes it learned
-			for _, peerRoutes := range res.Value {
-				for _, route := range peerRoutes {
-					if route != nil && route.Network != nil {
-						routes = append(routes, RouteInfo{Prefix: *route.Network})
-					}
-				}
+			if conn != nil && conn.Name != nil {
+				peers = append(peers, *conn.Name)
 			}
 		}
 	}
 
+	var (
+		mu     sync.Mutex
+		wg     sync.WaitGroup
+		routes []RouteInfo
+	)
+	for _, peer := range peers {
+		wg.Go(func() {
+			peerRoutes, err := p.learnedRoutes(ctx, peer)
+			if err != nil {
+				log.Warnf("%v", err)
+				return
+			}
+			mu.Lock()
+			routes = append(routes, peerRoutes...)
+			mu.Unlock()
+		})
+	}
+	wg.Wait()
+
+	return routes, nil
+}
+
+// learnedRoutes returns the routes the Route Server learned from one BGP peer.
+func (p *AzureRouteServerProvider) learnedRoutes(ctx context.Context, peer string) ([]RouteInfo, error) {
+	poller, err := p.bgpClient.BeginListLearnedRoutes(ctx, p.routeServerRG, p.routeServerName, peer, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query learned routes from peer %s: %w", peer, err)
+	}
+	res, err := poller.PollUntilDone(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to poll learned routes from peer %s: %w", peer, err)
+	}
+
+	var routes []RouteInfo
+	// Value maps each virtual router instance to the routes it learned
+	for _, instanceRoutes := range res.Value {
+		for _, route := range instanceRoutes {
+			if route != nil && route.Network != nil {
+				routes = append(routes, RouteInfo{Prefix: *route.Network})
+			}
+		}
+	}
 	return routes, nil
 }
 
