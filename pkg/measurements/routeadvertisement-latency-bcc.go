@@ -191,6 +191,7 @@ type raLatencyBCC struct {
 	routeMu            sync.Mutex // guards the fields of every *detectedRoute, written by several goroutines
 	podTimestamps      sync.Map   // key: subnet, value: *podMeasurement
 	detectedRouteCount uint64
+	finishedPingCount  uint64 // pings that succeeded (T5) or timed out
 	doneCh             chan struct{}
 	wg                 sync.WaitGroup
 	podIPCh            chan podIPNotification
@@ -743,6 +744,7 @@ func (r *raLatencyBCC) t4PingWorker() {
 
 func (r *raLatencyBCC) pingUntilReachable(podIP, subnet string) {
 	defer r.wg.Done()
+	defer atomic.AddUint64(&r.finishedPingCount, 1)
 	log.Debugf("Starting ping of POD %s in subnet %s", podIP, subnet)
 
 	ping := func() bool {
@@ -886,10 +888,10 @@ func (r *raLatencyBCC) Collect(measurementWg *sync.WaitGroup) {
 	defer measurementWg.Done()
 }
 
-// waitForCompletion polls until all routes are detected or maxTimeout is reached.
+// waitForCompletion returns once every subnet's route is detected and its pod's ping has finished
+// (succeeded or timed out), or when maxTimeout is reached. The workload creates one pod per subnet.
 func (r *raLatencyBCC) waitForCompletion(desiredCount uint64) {
-	var count uint64
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
 	timeoutTimer := time.NewTimer(maxTimeout)
@@ -898,16 +900,13 @@ func (r *raLatencyBCC) waitForCompletion(desiredCount uint64) {
 	for {
 		select {
 		case <-ticker.C:
-			count = atomic.LoadUint64(&r.detectedRouteCount)
-			log.Debugf("count %v , desiredCount %v", count, desiredCount)
-			if count >= desiredCount {
-				log.Debugf("Desired count reached, signaling stop.")
-				// Give additional 10 seconds for threads to finish (pings after detecting routes)
-				time.Sleep(10 * time.Second)
+			if atomic.LoadUint64(&r.detectedRouteCount) >= desiredCount && atomic.LoadUint64(&r.finishedPingCount) >= desiredCount {
+				log.Debugf("All %d routes detected and pings finished, signaling stop", desiredCount)
 				return
 			}
 		case <-timeoutTimer.C:
-			log.Debugf("Timeout reached, signaling stop.")
+			log.Warnf("Timeout reached with %d/%d routes detected and %d/%d pings finished",
+				atomic.LoadUint64(&r.detectedRouteCount), desiredCount, atomic.LoadUint64(&r.finishedPingCount), desiredCount)
 			return
 		}
 	}
@@ -926,7 +925,7 @@ func (r *raLatencyBCC) Stop() error {
 		return true
 	})
 
-	log.Infof("Waiting for %d routes to be detected in Route Server", desiredCount)
+	log.Infof("Waiting for %d routes to be detected and their pod pings to finish", desiredCount)
 	r.waitForCompletion(desiredCount)
 
 	close(r.doneCh)
