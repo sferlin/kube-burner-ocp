@@ -1023,6 +1023,7 @@ func (r *raLatencyBCC) Stop() error {
 }
 
 func (r *raLatencyBCC) normalizeMetrics() float64 {
+	var subnets, pings int
 	r.Metrics.Range(func(key, value any) bool {
 		m := value.(raMetricBCC)
 
@@ -1120,7 +1121,7 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 			m.T0_MaxLatency = t0Summary.Max
 			m.T0_AvgLatency = t0Summary.Avg
 			m.T0_P99Latency = t0Summary.P99
-			log.Infof("T0 (RA in Spec) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
+			log.Debugf("T0 (RA in Spec) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
 				m.Name, t0Summary.Min, t0Summary.Max, t0Summary.Avg, t0Summary.P99)
 		}
 
@@ -1131,7 +1132,7 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 			m.T0_5_MaxLatency = t05Summary.Max
 			m.T0_5_AvgLatency = t05Summary.Avg
 			m.T0_5_P99Latency = t05Summary.P99
-			log.Infof("T0.5 (RA Accepted) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
+			log.Debugf("T0.5 (RA Accepted) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
 				m.Name, t05Summary.Min, t05Summary.Max, t05Summary.Avg, t05Summary.P99)
 		}
 
@@ -1142,7 +1143,7 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 			m.T1_MaxLatency = t1Summary.Max
 			m.T1_AvgLatency = t1Summary.Avg
 			m.T1_P99Latency = t1Summary.P99
-			log.Infof("T1 (RIB) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
+			log.Debugf("T1 (RIB) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
 				m.Name, t1Summary.Min, t1Summary.Max, t1Summary.Avg, t1Summary.P99)
 		}
 
@@ -1153,7 +1154,7 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 			m.T2_MaxLatency = t2Summary.Max
 			m.T2_AvgLatency = t2Summary.Avg
 			m.T2_P99Latency = t2Summary.P99
-			log.Infof("T2 (FIB) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
+			log.Debugf("T2 (FIB) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
 				m.Name, t2Summary.Min, t2Summary.Max, t2Summary.Avg, t2Summary.P99)
 		}
 
@@ -1164,7 +1165,7 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 			m.T3_MaxLatency = t3Summary.Max
 			m.T3_AvgLatency = t3Summary.Avg
 			m.T3_P99Latency = t3Summary.P99
-			log.Infof("T3 (Route Table) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
+			log.Debugf("T3 (Route Table) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
 				m.Name, t3Summary.Min, t3Summary.Max, t3Summary.Avg, t3Summary.P99)
 		}
 
@@ -1175,7 +1176,7 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 			m.T3_5_MaxLatency = t35Summary.Max
 			m.T3_5_AvgLatency = t35Summary.Avg
 			m.T3_5_P99Latency = t35Summary.P99
-			log.Infof("T3.5 (All Peers) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
+			log.Debugf("T3.5 (All Peers) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
 				m.Name, t35Summary.Min, t35Summary.Max, t35Summary.Avg, t35Summary.P99)
 		}
 
@@ -1186,7 +1187,7 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 			m.T4_MaxLatency = t4Summary.Max
 			m.T4_AvgLatency = t4Summary.Avg
 			m.T4_P99Latency = t4Summary.P99
-			log.Infof("T4 (Pod IP Assigned) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
+			log.Debugf("T4 (Pod IP Assigned) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
 				m.Name, t4Summary.Min, t4Summary.Max, t4Summary.Avg, t4Summary.P99)
 		}
 
@@ -1198,61 +1199,38 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 			m.T5_AvgLatency = t5Summary.Avg
 			m.T5_P99Latency = t5Summary.P99
 			m.T5_SuccessfulPings = len(m.T5_PingSuccessLatency)
-			log.Infof("T5 (Ping Success) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms, Successful: %d",
+			log.Debugf("T5 (Ping Success) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms, Successful: %d",
 				m.Name, t5Summary.Min, t5Summary.Max, t5Summary.Avg, t5Summary.P99, m.T5_SuccessfulPings)
 		}
 
+		subnets += len(m.Subnets)
+		pings += m.T5_SuccessfulPings
 		r.NormLatencies = append(r.NormLatencies, m)
 		return true
 	})
+	log.Infof("T5 successful pings: %d/%d", pings, subnets)
 	return 0
 }
 
+// getLatency reports one latency per timestamp for each BGPRouting (the average over its subnets),
+// leaving out timestamps that were not collected. kube-burner aggregates these across BGPRoutings.
 func (r *raLatencyBCC) getLatency(normLatency any) map[string]float64 {
-	raMetric := normLatency.(raMetricBCC)
-	return map[string]float64{
-		// T0: RA in Spec
-		"T0_MinLatency": float64(raMetric.T0_MinLatency),
-		"T0_MaxLatency": float64(raMetric.T0_MaxLatency),
-		"T0_AvgLatency": float64(raMetric.T0_AvgLatency),
-		"T0_P99Latency": float64(raMetric.T0_P99Latency),
-		// T0.5: RA Accepted
-		"T0_5_MinLatency": float64(raMetric.T0_5_MinLatency),
-		"T0_5_MaxLatency": float64(raMetric.T0_5_MaxLatency),
-		"T0_5_AvgLatency": float64(raMetric.T0_5_AvgLatency),
-		"T0_5_P99Latency": float64(raMetric.T0_5_P99Latency),
-		// T1: RIB
-		"T1_MinLatency": float64(raMetric.T1_MinLatency),
-		"T1_MaxLatency": float64(raMetric.T1_MaxLatency),
-		"T1_AvgLatency": float64(raMetric.T1_AvgLatency),
-		"T1_P99Latency": float64(raMetric.T1_P99Latency),
-		// T2: FIB
-		"T2_MinLatency": float64(raMetric.T2_MinLatency),
-		"T2_MaxLatency": float64(raMetric.T2_MaxLatency),
-		"T2_AvgLatency": float64(raMetric.T2_AvgLatency),
-		"T2_P99Latency": float64(raMetric.T2_P99Latency),
-		// T3: Route Table
-		"T3_MinLatency": float64(raMetric.T3_MinLatency),
-		"T3_MaxLatency": float64(raMetric.T3_MaxLatency),
-		"T3_AvgLatency": float64(raMetric.T3_AvgLatency),
-		"T3_P99Latency": float64(raMetric.T3_P99Latency),
-		// T3.5: Route table on all BGP peer NICs (Azure only)
-		"T3_5_MinLatency": float64(raMetric.T3_5_MinLatency),
-		"T3_5_MaxLatency": float64(raMetric.T3_5_MaxLatency),
-		"T3_5_AvgLatency": float64(raMetric.T3_5_AvgLatency),
-		"T3_5_P99Latency": float64(raMetric.T3_5_P99Latency),
-		// T4: Pod IP Assigned
-		"T4_MinLatency": float64(raMetric.T4_MinLatency),
-		"T4_MaxLatency": float64(raMetric.T4_MaxLatency),
-		"T4_AvgLatency": float64(raMetric.T4_AvgLatency),
-		"T4_P99Latency": float64(raMetric.T4_P99Latency),
-		// T5: Ping Success
-		"T5_MinLatency":      float64(raMetric.T5_MinLatency),
-		"T5_MaxLatency":      float64(raMetric.T5_MaxLatency),
-		"T5_AvgLatency":      float64(raMetric.T5_AvgLatency),
-		"T5_P99Latency":      float64(raMetric.T5_P99Latency),
-		"T5_SuccessfulPings": float64(raMetric.T5_SuccessfulPings),
+	m := normLatency.(raMetricBCC)
+	latencies := map[string]float64{}
+	add := func(name string, samples []float64, avg int) {
+		if len(samples) > 0 {
+			latencies[name] = float64(avg)
+		}
 	}
+	add("T0", m.T0_RAInSpecLatency, m.T0_AvgLatency)
+	add("T0_5", m.T0_5_RAAcceptedLatency, m.T0_5_AvgLatency)
+	add("T1", m.T1_RibLatency, m.T1_AvgLatency)
+	add("T2", m.T2_FibLatency, m.T2_AvgLatency)
+	add("T3", m.T3_VpcRouteTableLatency, m.T3_AvgLatency)
+	add("T3_5", m.T3_5_AllPeersLatency, m.T3_5_AvgLatency)
+	add("T4", m.T4_PodIPAssignedLatency, m.T4_AvgLatency)
+	add("T5", m.T5_PingSuccessLatency, m.T5_AvgLatency)
+	return latencies
 }
 
 func (r *raLatencyBCC) IsCompatible() bool {
