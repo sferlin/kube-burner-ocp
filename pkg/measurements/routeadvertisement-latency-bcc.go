@@ -397,6 +397,10 @@ func (r *raLatencyBCC) worker(routeCh <-chan newRoute) {
 			if route.t1_RibTimestamp.IsZero() {
 				route.t1_RibTimestamp = now
 				log.Debugf("T1: Route %s in RIB at %v", subnet, now)
+				// On Azure, T1 and T3.5 come from independent queries; whichever arrives second completes the route
+				if cloudProvider == cloudProviderAzure && !route.t3_5_AllPeers.IsZero() {
+					atomic.AddUint64(&r.detectedRouteCount, 1)
+				}
 			}
 
 			// T2: Route becomes in-fib (state = active)
@@ -451,7 +455,7 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerPro
 		}
 
 		// Update timestamps for routes found in route table, using the time the provider first saw them.
-		// The route counts as detected at its last route table stage: T3 for AWS, T3.5 for Azure.
+		// A route counts as detected at T3 on AWS (T1 and T2 precede it); on Azure once it has both T3.5 and T1.
 		r.routeMu.Lock()
 		defer r.routeMu.Unlock()
 		for subnet, status := range found {
@@ -476,7 +480,9 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerPro
 			if !status.AllSeen.IsZero() && route.t3_5_AllPeers.IsZero() {
 				route.t3_5_AllPeers = status.AllSeen
 				log.Debugf("T3.5: Route %s found on all BGP peer NICs at %v", subnet, status.AllSeen)
-				atomic.AddUint64(&r.detectedRouteCount, 1)
+				if !route.t1_RibTimestamp.IsZero() {
+					atomic.AddUint64(&r.detectedRouteCount, 1)
+				}
 			}
 		}
 	}
