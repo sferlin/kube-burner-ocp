@@ -38,6 +38,9 @@ type AzureRouteServerProvider struct {
 	routeServerName string
 	routeServerRG   string
 	peerNICs        []*arm.ResourceID
+
+	mu     sync.Mutex
+	seenAt map[string]map[string]time.Time // subnet -> peer NIC name -> when its query first returned the subnet
 }
 
 // NewAzureRouteServerProvider creates a new Azure Route Server provider and discovers the NICs of its BGP peers.
@@ -71,6 +74,7 @@ func NewAzureRouteServerProvider(subscriptionID, routeServerRG, routeServerName 
 		nicClient:       nicClient,
 		routeServerName: routeServerName,
 		routeServerRG:   routeServerRG,
+		seenAt:          map[string]map[string]time.Time{},
 	}
 	if p.peerNICs, err = p.discoverPeerNICs(context.Background(), ipConfigClient); err != nil {
 		return nil, err
@@ -275,41 +279,65 @@ func (p *AzureRouteServerProvider) learnedRoutes(ctx context.Context, peer strin
 	return routes, nil
 }
 
-// CheckRouteTables reports, for each subnet, whether it is in the effective routes of at least
-// one BGP peer NIC (Any) and of every BGP peer NIC (All). All peer NICs are queried in parallel.
+// CheckRouteTables queries the effective routes of all BGP peer NICs in parallel. Each NIC is stamped
+// when its own query returns the subnet, so the result does not depend on the slowest NIC in a round.
+// FirstSeen is the earliest NIC sighting; AllSeen is the latest first sighting once every NIC has the subnet.
 func (p *AzureRouteServerProvider) CheckRouteTables(ctx context.Context, _ string, subnets []string) (map[string]RouteTableStatus, error) {
 	var (
-		mu       sync.Mutex
 		wg       sync.WaitGroup
+		errMu    sync.Mutex
 		firstErr error
-		counts   = map[string]int{}
 	)
 	for _, nic := range p.peerNICs {
 		wg.Go(func() {
 			prefixes, err := p.effectiveRoutes(ctx, nic)
-			mu.Lock()
-			defer mu.Unlock()
 			if err != nil {
+				errMu.Lock()
 				if firstErr == nil {
 					firstErr = err
 				}
+				errMu.Unlock()
 				return
 			}
+			at := time.Now().UTC()
+			p.mu.Lock()
+			defer p.mu.Unlock()
 			for _, subnet := range subnets {
-				if prefixes[subnet] {
-					counts[subnet]++
+				if !prefixes[subnet] {
+					continue
+				}
+				if p.seenAt[subnet] == nil {
+					p.seenAt[subnet] = map[string]time.Time{}
+				}
+				if _, seen := p.seenAt[subnet][nic.Name]; !seen {
+					p.seenAt[subnet][nic.Name] = at
 				}
 			}
 		})
 	}
 	wg.Wait()
+	// Sightings from NICs that answered are kept, so a failed round loses no timestamps
 	if firstErr != nil {
 		return nil, firstErr
 	}
 
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	found := make(map[string]RouteTableStatus, len(subnets))
 	for _, subnet := range subnets {
-		found[subnet] = RouteTableStatus{Any: counts[subnet] > 0, All: counts[subnet] == len(p.peerNICs)}
+		var status RouteTableStatus
+		for _, at := range p.seenAt[subnet] {
+			if status.FirstSeen.IsZero() || at.Before(status.FirstSeen) {
+				status.FirstSeen = at
+			}
+			if at.After(status.AllSeen) {
+				status.AllSeen = at
+			}
+		}
+		if len(p.seenAt[subnet]) < len(p.peerNICs) {
+			status.AllSeen = time.Time{}
+		}
+		found[subnet] = status
 	}
 	return found, nil
 }

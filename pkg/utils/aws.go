@@ -17,6 +17,7 @@ package utils
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -114,6 +115,7 @@ func (o *BCCRouteServerObserver) CheckRouteTables(ctx context.Context, resourceI
 	if err != nil {
 		return nil, fmt.Errorf("describe route tables: %w", err)
 	}
+	now := time.Now().UTC()
 
 	// Map of subnet → exists in VPC route table
 	found := make(map[string]RouteTableStatus)
@@ -126,7 +128,7 @@ func (o *BCCRouteServerObserver) CheckRouteTables(ctx context.Context, resourceI
 		for _, route := range rt.Routes {
 			destCidr := aws.ToString(route.DestinationCidrBlock)
 			if _, checking := found[destCidr]; checking {
-				found[destCidr] = RouteTableStatus{Any: true}
+				found[destCidr] = RouteTableStatus{FirstSeen: now}
 			}
 		}
 	}

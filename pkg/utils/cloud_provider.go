@@ -17,6 +17,7 @@ package utils
 import (
 	"context"
 	"fmt"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -39,11 +40,11 @@ type BCCRouteServerProvider interface {
 	CheckRouteTables(ctx context.Context, resourceID string, subnets []string) (map[string]RouteTableStatus, error)
 }
 
-// RouteTableStatus reports where a subnet was found. All is only set by providers that check
-// several locations which must each receive the route (Azure BGP peer NICs).
+// RouteTableStatus reports when a subnet was first found; zero times mean not found yet. AllSeen is only
+// set by providers that check several locations which must each receive the route (Azure BGP peer NICs).
 type RouteTableStatus struct {
-	Any bool // found in at least one route table
-	All bool // found in every route table checked
+	FirstSeen time.Time // first found in any route table
+	AllSeen   time.Time // found in every route table checked (when the last one first had it)
 }
 
 // ValidateConnectivity tests a Route Server provider's connectivity.

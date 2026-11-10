@@ -446,11 +446,10 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerPro
 			return
 		}
 
-		// Update timestamps for routes found in route table. The route counts as detected at its
-		// last route table stage: T3 for AWS, T3.5 for Azure.
-		now := time.Now().UTC()
+		// Update timestamps for routes found in route table, using the time the provider first saw them.
+		// The route counts as detected at its last route table stage: T3 for AWS, T3.5 for Azure.
 		for subnet, status := range found {
-			if !status.Any {
+			if status.FirstSeen.IsZero() {
 				continue
 			}
 			val, ok := r.routeTimestamps.Load(subnet)
@@ -460,17 +459,17 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerPro
 			route := val.(*detectedRoute)
 			if route.t3_VpcTimestamp.IsZero() {
 				if cloudProvider == cloudProviderAzure && route.t2_FibTimestamp.IsZero() {
-					route.t2_FibTimestamp = now
+					route.t2_FibTimestamp = status.FirstSeen
 				}
-				route.t3_VpcTimestamp = now
-				log.Debugf("T3: Route %s found in route table at %v", subnet, now)
+				route.t3_VpcTimestamp = status.FirstSeen
+				log.Debugf("T3: Route %s found in route table at %v", subnet, status.FirstSeen)
 				if cloudProvider != cloudProviderAzure {
 					atomic.AddUint64(&r.detectedRouteCount, 1)
 				}
 			}
-			if status.All && route.t3_5_AllPeers.IsZero() {
-				route.t3_5_AllPeers = now
-				log.Debugf("T3.5: Route %s found on all BGP peer NICs at %v", subnet, now)
+			if !status.AllSeen.IsZero() && route.t3_5_AllPeers.IsZero() {
+				route.t3_5_AllPeers = status.AllSeen
+				log.Debugf("T3.5: Route %s found on all BGP peer NICs at %v", subnet, status.AllSeen)
 				atomic.AddUint64(&r.detectedRouteCount, 1)
 			}
 			r.routeTimestamps.Store(subnet, route)
