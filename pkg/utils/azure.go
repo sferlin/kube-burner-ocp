@@ -17,6 +17,7 @@ package utils
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
@@ -72,8 +73,13 @@ func NewAzureRouteServerProvider(subscriptionID, routeServerRG, routeServerName 
 	if p.peerNICs, err = p.discoverPeerNICs(context.Background(), ipConfigClient); err != nil {
 		return nil, err
 	}
+	nicsByRG := map[string][]string{}
 	for _, nic := range p.peerNICs {
-		log.Infof("Using BGP peer NIC %s/%s for route table detection", nic.ResourceGroupName, nic.Name)
+		nicsByRG[nic.ResourceGroupName] = append(nicsByRG[nic.ResourceGroupName], nic.Name)
+	}
+	for rg, names := range nicsByRG {
+		slices.Sort(names)
+		log.Infof("Using %d BGP peer NICs in resource group %s for route table detection: %s", len(names), rg, strings.Join(names, ", "))
 	}
 
 	return p, nil
