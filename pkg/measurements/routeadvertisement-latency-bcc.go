@@ -187,8 +187,9 @@ type networkStatus struct {
 type raLatencyBCC struct {
 	measurements.BaseMeasurement
 
-	routeTimestamps    sync.Map // key: subnet, value: *detectedRoute
-	podTimestamps      sync.Map // key: subnet, value: *podMeasurement
+	routeTimestamps    sync.Map   // key: subnet, value: *detectedRoute
+	routeMu            sync.Mutex // guards the fields of every *detectedRoute, written by several goroutines
+	podTimestamps      sync.Map   // key: subnet, value: *podMeasurement
 	detectedRouteCount uint64
 	doneCh             chan struct{}
 	wg                 sync.WaitGroup
@@ -263,6 +264,8 @@ func (r *raLatencyBCC) handleBGPRoutingUpdate(_, newObj any) {
 	conditions, _, _ := unstructured.NestedSlice(bgpRouting.UnstructuredContent(), "status", "conditions")
 	now := time.Now().UTC()
 
+	r.routeMu.Lock()
+	defer r.routeMu.Unlock()
 	for _, c := range conditions {
 		cond, ok := c.(map[string]any)
 		if !ok || cond["status"] != conditionStatusTrue {
@@ -283,7 +286,6 @@ func (r *raLatencyBCC) handleBGPRoutingUpdate(_, newObj any) {
 					log.Debugf("T0.5: RouteAdvertisements for subnet %s created at %v", subnet, now)
 				}
 			}
-			r.routeTimestamps.Store(subnet, route)
 		}
 	}
 }
@@ -387,6 +389,7 @@ func (r *raLatencyBCC) worker(routeCh <-chan newRoute) {
 			subnet := update.Dst
 			now := update.Ts
 
+			r.routeMu.Lock()
 			val, _ := r.routeTimestamps.LoadOrStore(subnet, &detectedRoute{subnet: subnet})
 			route := val.(*detectedRoute)
 
@@ -401,8 +404,7 @@ func (r *raLatencyBCC) worker(routeCh <-chan newRoute) {
 				route.t2_FibTimestamp = now
 				log.Debugf("T2: Route %s in FIB at %v", subnet, now)
 			}
-
-			r.routeTimestamps.Store(subnet, route)
+			r.routeMu.Unlock()
 
 		case <-r.doneCh:
 			return
@@ -421,6 +423,7 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerPro
 		// Collect subnets still waiting for route table detection. AWS only checks routes already in FIB (T2)
 		// until T3; Azure exposes no FIB state, so every tracked route is checked until T3.5.
 		var pendingSubnets []string
+		r.routeMu.Lock()
 		r.routeTimestamps.Range(func(key, value any) bool {
 			subnet := key.(string)
 			route := value.(*detectedRoute)
@@ -434,6 +437,7 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerPro
 			}
 			return true
 		})
+		r.routeMu.Unlock()
 
 		if len(pendingSubnets) == 0 {
 			return
@@ -448,6 +452,8 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerPro
 
 		// Update timestamps for routes found in route table, using the time the provider first saw them.
 		// The route counts as detected at its last route table stage: T3 for AWS, T3.5 for Azure.
+		r.routeMu.Lock()
+		defer r.routeMu.Unlock()
 		for subnet, status := range found {
 			if status.FirstSeen.IsZero() {
 				continue
@@ -472,7 +478,6 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerPro
 				log.Debugf("T3.5: Route %s found on all BGP peer NICs at %v", subnet, status.AllSeen)
 				atomic.AddUint64(&r.detectedRouteCount, 1)
 			}
-			r.routeTimestamps.Store(subnet, route)
 		}
 	}
 
@@ -937,7 +942,9 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 				continue
 			}
 
-			routeVal := val.(*detectedRoute)
+			r.routeMu.Lock()
+			routeVal := *val.(*detectedRoute)
+			r.routeMu.Unlock()
 
 			// Calculate T0 latency (CUDN created)
 			if !routeVal.t0_NetworkCreated.IsZero() {
