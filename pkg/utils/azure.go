@@ -17,71 +17,124 @@ package utils
 import (
 	"context"
 	"fmt"
-	"strings"
+	"sync"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	armnetwork "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v5"
 	log "github.com/sirupsen/logrus"
 )
 
-// AzureRouteServerProvider provides methods to interact with Azure Route Server.
-// It implements the BCCRouteServerProvider interface.
-// Azure BGP route flow:
-//   - T1: Route Server learned BGP routes (via BeginListLearnedRoutes)
-//   - T2+T3: Network Interface effective routes (via BeginGetEffectiveRouteTable)
+// AzureRouteServerProvider implements BCCRouteServerProvider for Azure Route Server.
+// T1 comes from the Route Server's BGP learned routes. Route table presence comes from the
+// effective routes of the BGP peer NICs, since Azure exposes no separate FIB state.
 type AzureRouteServerProvider struct {
 	bgpClient       *armnetwork.VirtualHubBgpConnectionsClient
 	nicClient       *armnetwork.InterfacesClient
 	routeServerName string
 	routeServerRG   string
-	nicResourceID   string
-	subscriptionID  string
+	peerNICs        []*arm.ResourceID
 }
 
-// NewAzureRouteServerProvider creates a new Azure Route Server provider.
-// nicResourceID is the Route Server's NIC resource ID (format: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Network/networkInterfaces/{nic}).
-func NewAzureRouteServerProvider(subscriptionID, routeServerRG, routeServerName, nicResourceID string) (*AzureRouteServerProvider, error) {
-	if err := validateAzureParams(subscriptionID, routeServerRG, routeServerName); err != nil {
-		return nil, err
+// NewAzureRouteServerProvider creates a new Azure Route Server provider and discovers the NICs of its BGP peers.
+func NewAzureRouteServerProvider(subscriptionID, routeServerRG, routeServerName string) (*AzureRouteServerProvider, error) {
+	if subscriptionID == "" || routeServerRG == "" || routeServerName == "" {
+		return nil, fmt.Errorf("azure subscription ID, resource group and route server name are required")
 	}
 
-	// Create credential (uses DefaultAzureCredential which tries multiple auth methods)
 	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create Azure credentials: %w", err)
 	}
 
-	// Create Virtual Hub BGP Connections client for querying learned routes (T1)
 	bgpClient, err := armnetwork.NewVirtualHubBgpConnectionsClient(subscriptionID, cred, nil)
 	if err != nil {
-		return nil, fmt.Errorf("unable to create Azure Virtual Hub BGP Connections client: %w", err)
+		return nil, fmt.Errorf("unable to create Azure BGP connections client: %w", err)
 	}
 
-	// Create Network Interfaces client for querying effective routes (T2+T3)
 	nicClient, err := armnetwork.NewInterfacesClient(subscriptionID, cred, nil)
 	if err != nil {
-		return nil, fmt.Errorf("unable to create Azure Network Interfaces client: %w", err)
+		return nil, fmt.Errorf("unable to create Azure network interfaces client: %w", err)
 	}
 
-	return &AzureRouteServerProvider{
+	p := &AzureRouteServerProvider{
 		bgpClient:       bgpClient,
 		nicClient:       nicClient,
 		routeServerName: routeServerName,
 		routeServerRG:   routeServerRG,
-		nicResourceID:   nicResourceID,
-		subscriptionID:  subscriptionID,
-	}, nil
+	}
+	if p.peerNICs, err = p.discoverPeerNICs(context.Background()); err != nil {
+		return nil, err
+	}
+	for _, nic := range p.peerNICs {
+		log.Infof("Using BGP peer NIC %s/%s for route table detection", nic.ResourceGroupName, nic.Name)
+	}
+
+	return p, nil
 }
 
-// GetRoutes retrieves all routes learned by the Azure Route Server (T1/RIB).
-// Queries the Route Server's BGP RIB directly via VirtualHubBgpConnectionsClient.BeginListLearnedRoutes.
-// Returns routes learned from all BGP connections as cloud-agnostic RouteInfo objects.
-func (p *AzureRouteServerProvider) GetRoutes(ctx context.Context) ([]RouteInfo, error) {
-	var allRoutes []RouteInfo
-
-	// List all BGP connections on the Route Server and query learned routes from each
+// discoverPeerNICs maps each BGP peer IP of the Route Server to the NIC holding that private IP.
+func (p *AzureRouteServerProvider) discoverPeerNICs(ctx context.Context) ([]*arm.ResourceID, error) {
+	peerIPs := map[string]bool{}
 	connPager := p.bgpClient.NewListPager(p.routeServerRG, p.routeServerName, nil)
+	for connPager.More() {
+		page, err := connPager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list BGP connections: %w", err)
+		}
+		for _, conn := range page.Value {
+			if conn != nil && conn.Properties != nil && conn.Properties.PeerIP != nil {
+				peerIPs[*conn.Properties.PeerIP] = true
+			}
+		}
+	}
+	if len(peerIPs) == 0 {
+		return nil, fmt.Errorf("route server %s has no BGP peers", p.routeServerName)
+	}
 
+	nicsByIP := map[string][]string{}
+	nicPager := p.nicClient.NewListAllPager(nil)
+	for nicPager.More() {
+		page, err := nicPager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list network interfaces: %w", err)
+		}
+		for _, nic := range page.Value {
+			if nic == nil || nic.ID == nil || nic.Properties == nil {
+				continue
+			}
+			for _, ipConfig := range nic.Properties.IPConfigurations {
+				if ipConfig == nil || ipConfig.Properties == nil || ipConfig.Properties.PrivateIPAddress == nil {
+					continue
+				}
+				if ip := *ipConfig.Properties.PrivateIPAddress; peerIPs[ip] {
+					nicsByIP[ip] = append(nicsByIP[ip], *nic.ID)
+				}
+			}
+		}
+	}
+
+	var nics []*arm.ResourceID
+	for ip := range peerIPs {
+		ids := nicsByIP[ip]
+		if len(ids) != 1 {
+			return nil, fmt.Errorf("BGP peer IP %s must match exactly one NIC in the subscription, found %d: %v", ip, len(ids), ids)
+		}
+		nic, err := arm.ParseResourceID(ids[0])
+		if err != nil {
+			return nil, fmt.Errorf("invalid NIC resource ID %q: %w", ids[0], err)
+		}
+		nics = append(nics, nic)
+	}
+
+	return nics, nil
+}
+
+// GetRoutes returns the routes learned by the Route Server from all of its BGP peers (T1).
+func (p *AzureRouteServerProvider) GetRoutes(ctx context.Context) ([]RouteInfo, error) {
+	var routes []RouteInfo
+
+	connPager := p.bgpClient.NewListPager(p.routeServerRG, p.routeServerName, nil)
 	for connPager.More() {
 		connPage, err := connPager.NextPage(ctx)
 		if err != nil {
@@ -98,129 +151,96 @@ func (p *AzureRouteServerProvider) GetRoutes(ctx context.Context) ([]RouteInfo, 
 				log.Warnf("failed to query learned routes from peer %s: %v", *conn.Name, err)
 				continue
 			}
-
 			res, err := poller.PollUntilDone(ctx, nil)
 			if err != nil {
 				log.Warnf("failed to poll learned routes from peer %s: %v", *conn.Name, err)
 				continue
 			}
 
-			for _, routeList := range res.Value {
-				for _, route := range routeList {
+			// Value maps each virtual router instance to the routes it learned
+			for _, peerRoutes := range res.Value {
+				for _, route := range peerRoutes {
 					if route != nil && route.Network != nil {
-						allRoutes = append(allRoutes, RouteInfo{
-							Prefix: *route.Network,
-							InFIB:  false, // Learned routes are in RIB, not FIB
-						})
+						routes = append(routes, RouteInfo{Prefix: *route.Network})
 					}
 				}
 			}
 		}
 	}
 
-	return allRoutes, nil
+	return routes, nil
 }
 
-// CheckRouteTables checks which subnets are present in the Route Server's NIC effective routes (T2+T3).
-// resourceID is the Route Server's NIC resource ID (format: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Network/networkInterfaces/{nic}).
-// If empty, uses the provider's configured nicResourceID.
-func (p *AzureRouteServerProvider) CheckRouteTables(ctx context.Context, resourceID string, subnets []string) (map[string]bool, error) {
-	if len(subnets) == 0 {
-		return make(map[string]bool), nil
+// CheckRouteTables reports, for each subnet, whether it is in the effective routes of at least
+// one BGP peer NIC (Any) and of every BGP peer NIC (All). All peer NICs are queried in parallel.
+func (p *AzureRouteServerProvider) CheckRouteTables(ctx context.Context, _ string, subnets []string) (map[string]RouteTableStatus, error) {
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		firstErr error
+		counts   = map[string]int{}
+	)
+	for _, nic := range p.peerNICs {
+		wg.Go(func() {
+			prefixes, err := p.effectiveRoutes(ctx, nic)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				return
+			}
+			for _, subnet := range subnets {
+				if prefixes[subnet] {
+					counts[subnet]++
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
 	}
 
-	// Use provided resourceID or fall back to configured NIC resource ID
-	nicID := resourceID
-	if nicID == "" {
-		nicID = p.nicResourceID
-	}
-
-	if nicID == "" {
-		return nil, fmt.Errorf("route server NIC resource ID is required")
-	}
-
-	// Parse NIC resource ID to extract resource group and NIC name
-	// Format: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Network/networkInterfaces/{nic}
-	parts := parseResourceID(nicID)
-	if parts["rg"] == "" || parts["nic"] == "" {
-		return nil, fmt.Errorf("invalid NIC resource ID format: %s", nicID)
-	}
-
-	// Initialize map with all subnets marked as not found
-	found := make(map[string]bool)
+	found := make(map[string]RouteTableStatus, len(subnets))
 	for _, subnet := range subnets {
-		found[subnet] = false
+		found[subnet] = RouteTableStatus{Any: counts[subnet] > 0, All: counts[subnet] == len(p.peerNICs)}
 	}
+	return found, nil
+}
 
-	// Query effective routes on the Route Server's NIC (T2+T3: BGP routes installed for forwarding)
-	poller, err := p.nicClient.BeginGetEffectiveRouteTable(ctx, parts["rg"], parts["nic"], nil)
+// effectiveRoutes returns the address prefixes in a NIC's effective route table.
+func (p *AzureRouteServerProvider) effectiveRoutes(ctx context.Context, nic *arm.ResourceID) (map[string]bool, error) {
+	poller, err := p.nicClient.BeginGetEffectiveRouteTable(ctx, nic.ResourceGroupName, nic.Name, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query effective routes on Route Server NIC: %w", err)
+		return nil, fmt.Errorf("failed to query effective routes of NIC %s: %w", nic.Name, err)
 	}
-
 	res, err := poller.PollUntilDone(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to poll effective routes: %w", err)
+		return nil, fmt.Errorf("failed to poll effective routes of NIC %s: %w", nic.Name, err)
 	}
 
-	// Check if any of our target subnets appear in effective routes
+	prefixes := map[string]bool{}
 	for _, route := range res.Value {
-		if route == nil || route.AddressPrefix == nil {
+		if route == nil {
 			continue
 		}
 		for _, prefix := range route.AddressPrefix {
 			if prefix != nil {
-				if _, checking := found[*prefix]; checking {
-					found[*prefix] = true
-				}
+				prefixes[*prefix] = true
 			}
 		}
 	}
-
-	return found, nil
+	return prefixes, nil
 }
 
-// parseResourceID extracts components from an Azure resource ID.
-// Format: /subscriptions/{sub}/resourceGroups/{rg}/providers/{provider}/{type}/{name}
-func parseResourceID(id string) map[string]string {
-	parts := map[string]string{}
-	segments := strings.Split(strings.TrimPrefix(id, "/"), "/")
-
-	for i := 0; i < len(segments)-1; i += 2 {
-		switch segments[i] {
-		case "resourceGroups":
-			parts["rg"] = segments[i+1]
-		case "networkInterfaces":
-			parts["nic"] = segments[i+1]
-		}
-	}
-
-	return parts
-}
-
-// ValidateAzureConnectivity validates Azure credentials and connectivity to Route Server and route tables.
+// ValidateAzureConnectivity validates Azure credentials, BGP peer NIC discovery, and access to the peers' effective routes.
 func ValidateAzureConnectivity(subscriptionID, resourceGroup, routeServerName string) error {
-	provider, err := NewAzureRouteServerProvider(subscriptionID, resourceGroup, routeServerName, "")
+	provider, err := NewAzureRouteServerProvider(subscriptionID, resourceGroup, routeServerName)
 	if err != nil {
-		return fmt.Errorf("invalid Azure credentials (check credentials, subscription, resource group, and route server name): %w", err)
+		return fmt.Errorf("invalid Azure configuration (check credentials, subscription, resource group, and route server name): %w", err)
 	}
 
 	return ValidateConnectivity("Azure", provider, "")
 }
-
-// validateAzureParams validates required Azure parameters.
-func validateAzureParams(subscriptionID, resourceGroup, routeServerName string) error {
-	if subscriptionID == "" {
-		return fmt.Errorf("azure subscription ID is empty")
-	}
-	if resourceGroup == "" {
-		return fmt.Errorf("azure resource group is empty")
-	}
-	if routeServerName == "" {
-		return fmt.Errorf("azure route server name is empty")
-	}
-	return nil
-}
-
-// Ensure AzureRouteServerProvider implements BCCRouteServerProvider
-var _ BCCRouteServerProvider = (*AzureRouteServerProvider)(nil)

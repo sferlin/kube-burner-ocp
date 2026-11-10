@@ -34,10 +34,16 @@ type BCCRouteServerProvider interface {
 	GetRoutes(ctx context.Context) ([]RouteInfo, error)
 
 	// CheckRouteTables checks which subnets are present in cloud-specific routing resources.
-	// For AWS: checks VPC route tables for destination CIDR blocks.
-	// For Azure: checks route tables for address prefixes.
-	// resourceID is cloud-specific (vpcId for AWS, routeTableResourceGroup for Azure).
-	CheckRouteTables(ctx context.Context, resourceID string, subnets []string) (map[string]bool, error)
+	// For AWS: checks the route tables of the VPC given by resourceID.
+	// For Azure: checks the effective routes of every BGP peer NIC; resourceID is unused.
+	CheckRouteTables(ctx context.Context, resourceID string, subnets []string) (map[string]RouteTableStatus, error)
+}
+
+// RouteTableStatus reports where a subnet was found. All is only set by providers that check
+// several locations which must each receive the route (Azure BGP peer NICs).
+type RouteTableStatus struct {
+	Any bool // found in at least one route table
+	All bool // found in every route table checked
 }
 
 // ValidateConnectivity tests a Route Server provider's connectivity.

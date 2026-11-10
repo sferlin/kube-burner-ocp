@@ -82,7 +82,6 @@ func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 	var azureSubscriptionID string
 	var azureResourceGroup string
 	var azureRouteServerName string
-	var azureNicResourceID string
 
 	var rc int
 	cmd := &cobra.Command{
@@ -128,7 +127,6 @@ func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 				AdditionalVars["AZURE_SUBSCRIPTION_ID"] = azureSubscriptionID
 				AdditionalVars["AZURE_RESOURCE_GROUP"] = azureResourceGroup
 				AdditionalVars["AZURE_ROUTE_SERVER_NAME"] = azureRouteServerName
-				AdditionalVars["AZURE_NIC_RESOURCE_ID"] = azureNicResourceID
 			}
 
 			wh.SetMeasurements(additionalMeasurementFactoryMapBCC)
@@ -157,7 +155,5 @@ func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 	cmd.Flags().StringVar(&azureSubscriptionID, "azure-subscription-id", "", "[Azure] Azure subscription ID")
 	cmd.Flags().StringVar(&azureResourceGroup, "azure-resource-group", "", "[Azure] Azure resource group containing Route Server")
 	cmd.Flags().StringVar(&azureRouteServerName, "azure-route-server-name", "", "[Azure] Azure Route Server name")
-	cmd.Flags().StringVar(&azureNicResourceID, "azure-nic-resource-id", "", "[Azure] Route Server's NIC resource ID (format: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Network/networkInterfaces/{nic})")
-
 	return cmd
 }

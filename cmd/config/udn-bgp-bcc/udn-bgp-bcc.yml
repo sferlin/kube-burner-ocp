@@ -60,7 +60,6 @@ jobs:
           azureSubscriptionId: {{.AZURE_SUBSCRIPTION_ID}}
           azureResourceGroup: {{.AZURE_RESOURCE_GROUP}}
           azureRouteServerName: {{.AZURE_ROUTE_SERVER_NAME}}
-          azureNicResourceId: {{.AZURE_NIC_RESOURCE_ID}}
 {{ end }}
       - objectTemplate: pod.yml
         replicas: 1
