@@ -20,8 +20,10 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	azruntime "github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	armnetwork "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork/v5"
 	log "github.com/sirupsen/logrus"
@@ -230,13 +232,33 @@ func (p *AzureRouteServerProvider) GetRoutes(ctx context.Context) ([]RouteInfo, 
 	return routes, nil
 }
 
+// pollEverySecond drives a long-running operation to completion, checking its status every second.
+// PollUntilDone honors the server's Retry-After (often ~10s), which would delay route detection by that much.
+func pollEverySecond[T any](ctx context.Context, poller *azruntime.Poller[T]) (T, error) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for !poller.Done() {
+		select {
+		case <-ctx.Done():
+			var zero T
+			return zero, ctx.Err()
+		case <-ticker.C:
+		}
+		if _, err := poller.Poll(ctx); err != nil {
+			var zero T
+			return zero, err
+		}
+	}
+	return poller.Result(ctx)
+}
+
 // learnedRoutes returns the routes the Route Server learned from one BGP peer.
 func (p *AzureRouteServerProvider) learnedRoutes(ctx context.Context, peer string) ([]RouteInfo, error) {
 	poller, err := p.bgpClient.BeginListLearnedRoutes(ctx, p.routeServerRG, p.routeServerName, peer, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query learned routes from peer %s: %w", peer, err)
 	}
-	res, err := poller.PollUntilDone(ctx, nil)
+	res, err := pollEverySecond(ctx, poller)
 	if err != nil {
 		return nil, fmt.Errorf("failed to poll learned routes from peer %s: %w", peer, err)
 	}
@@ -298,7 +320,7 @@ func (p *AzureRouteServerProvider) effectiveRoutes(ctx context.Context, nic *arm
 	if err != nil {
 		return nil, fmt.Errorf("failed to query effective routes of NIC %s: %w", nic.Name, err)
 	}
-	res, err := poller.PollUntilDone(ctx, nil)
+	res, err := pollEverySecond(ctx, poller)
 	if err != nil {
 		return nil, fmt.Errorf("failed to poll effective routes of NIC %s: %w", nic.Name, err)
 	}
