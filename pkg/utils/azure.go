@@ -37,6 +37,7 @@ type AzureRouteServerProvider struct {
 	nicClient       *armnetwork.InterfacesClient
 	routeServerName string
 	routeServerRG   string
+	peerConnections []string // BGP connection names, discovered once at startup
 	peerNICs        []*arm.ResourceID
 
 	mu     sync.Mutex
@@ -76,7 +77,17 @@ func NewAzureRouteServerProvider(subscriptionID, routeServerRG, routeServerName 
 		routeServerRG:   routeServerRG,
 		seenAt:          map[string]map[string]time.Time{},
 	}
-	if p.peerNICs, err = p.discoverPeerNICs(context.Background(), ipConfigClient); err != nil {
+	ctx := context.Background()
+	peers, err := p.bgpPeers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	peerIPs := map[string]bool{}
+	for name, ip := range peers {
+		p.peerConnections = append(p.peerConnections, name)
+		peerIPs[ip] = true
+	}
+	if p.peerNICs, err = p.discoverPeerNICs(ctx, ipConfigClient, peerIPs); err != nil {
 		return nil, err
 	}
 	nicsByRG := map[string][]string{}
@@ -93,12 +104,8 @@ func NewAzureRouteServerProvider(subscriptionID, routeServerRG, routeServerName 
 
 // discoverPeerNICs maps each BGP peer IP of the Route Server to the NIC holding that private IP
 // in the Route Server's VNet. Private IPs are only unique within a VNet.
-func (p *AzureRouteServerProvider) discoverPeerNICs(ctx context.Context, ipConfigClient *armnetwork.VirtualHubIPConfigurationClient) ([]*arm.ResourceID, error) {
+func (p *AzureRouteServerProvider) discoverPeerNICs(ctx context.Context, ipConfigClient *armnetwork.VirtualHubIPConfigurationClient, peerIPs map[string]bool) ([]*arm.ResourceID, error) {
 	vnet, err := p.routeServerVNet(ctx, ipConfigClient)
-	if err != nil {
-		return nil, err
-	}
-	peerIPs, err := p.peerIPs(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -139,9 +146,9 @@ func (p *AzureRouteServerProvider) routeServerVNet(ctx context.Context, ipConfig
 	return "", fmt.Errorf("could not determine the VNet of route server %s", p.routeServerName)
 }
 
-// peerIPs returns the IPs of the Route Server's BGP peers.
-func (p *AzureRouteServerProvider) peerIPs(ctx context.Context) (map[string]bool, error) {
-	ips := map[string]bool{}
+// bgpPeers returns the Route Server's BGP connections, mapping connection name to peer IP.
+func (p *AzureRouteServerProvider) bgpPeers(ctx context.Context) (map[string]string, error) {
+	peers := map[string]string{}
 	pager := p.bgpClient.NewListPager(p.routeServerRG, p.routeServerName, nil)
 	for pager.More() {
 		page, err := pager.NextPage(ctx)
@@ -149,15 +156,15 @@ func (p *AzureRouteServerProvider) peerIPs(ctx context.Context) (map[string]bool
 			return nil, fmt.Errorf("failed to list BGP connections: %w", err)
 		}
 		for _, conn := range page.Value {
-			if conn != nil && conn.Properties != nil && conn.Properties.PeerIP != nil {
-				ips[*conn.Properties.PeerIP] = true
+			if conn != nil && conn.Name != nil && conn.Properties != nil && conn.Properties.PeerIP != nil {
+				peers[*conn.Name] = *conn.Properties.PeerIP
 			}
 		}
 	}
-	if len(ips) == 0 {
+	if len(peers) == 0 {
 		return nil, fmt.Errorf("route server %s has no BGP peers", p.routeServerName)
 	}
-	return ips, nil
+	return peers, nil
 }
 
 // nicsByIP returns the IDs of the NICs in vnet that hold one of the given private IPs, keyed by IP.
@@ -200,27 +207,13 @@ func vnetOf(subnetID string) string {
 // GetRoutes returns the routes learned by the Route Server from all of its BGP peers (T1).
 // Each peer's learned routes are a separate long-running operation, so all peers are queried in parallel.
 func (p *AzureRouteServerProvider) GetRoutes(ctx context.Context) ([]RouteInfo, error) {
-	var peers []string
-	connPager := p.bgpClient.NewListPager(p.routeServerRG, p.routeServerName, nil)
-	for connPager.More() {
-		connPage, err := connPager.NextPage(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("failed to list BGP connections: %w", err)
-		}
-		for _, conn := range connPage.Value {
-			if conn != nil && conn.Name != nil {
-				peers = append(peers, *conn.Name)
-			}
-		}
-	}
-
 	var (
 		mu        sync.Mutex
 		wg        sync.WaitGroup
 		routes    []RouteInfo
 		durations []time.Duration
 	)
-	for _, peer := range peers {
+	for _, peer := range p.peerConnections {
 		wg.Go(func() {
 			start := time.Now()
 			peerRoutes, err := p.learnedRoutes(ctx, peer)

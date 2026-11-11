@@ -370,11 +370,37 @@ func (r *raLatencyBCC) observerWorker(routeProvider utils.BCCRouteServerProvider
 	for {
 		select {
 		case <-ticker.C:
-			read()
+			if r.routeServerPending() {
+				read()
+			}
 		case <-r.doneCh:
 			return
 		}
 	}
+}
+
+// routeServerPending reports whether any BGPRouting subnet still needs a Route Server observation:
+// T1 on Azure, T2 on AWS (which follows T1). Polling stops otherwise, to avoid cloud API throttling.
+func (r *raLatencyBCC) routeServerPending() bool {
+	r.routeMu.Lock()
+	defer r.routeMu.Unlock()
+	pending := false
+	r.Metrics.Range(func(_, value any) bool {
+		for _, subnet := range value.(raMetricBCC).Subnets {
+			val, ok := r.routeTimestamps.Load(subnet)
+			if !ok {
+				pending = true
+				return false
+			}
+			route := val.(*detectedRoute)
+			if route.t1_RibTimestamp.IsZero() || (cloudProvider != cloudProviderAzure && route.t2_FibTimestamp.IsZero()) {
+				pending = true
+				return false
+			}
+		}
+		return true
+	})
+	return pending
 }
 
 // worker records T1 (RIB) and T2 (FIB) timestamps as routes are advertised to Route Server.
