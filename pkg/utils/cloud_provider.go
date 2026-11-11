@@ -26,6 +26,10 @@ import (
 type RouteInfo struct {
 	Prefix string // CIDR block (e.g., "10.0.0.0/16")
 	InFIB  bool   // Whether the route is active in the Forwarding Information Base
+
+	// Only set by providers that query the RIB per BGP peer (Azure); zero otherwise.
+	FirstSeen time.Time // first peer that reported the route
+	AllSeen   time.Time // when the last peer first reported it, once every peer has
 }
 
 // BCCRouteServerProvider defines the interface for cloud-specific Route Server operations.
