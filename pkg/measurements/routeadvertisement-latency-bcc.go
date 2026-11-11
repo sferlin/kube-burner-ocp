@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,7 +29,6 @@ import (
 	"github.com/kube-burner/kube-burner-ocp/pkg/utils"
 	"github.com/kube-burner/kube-burner/v2/pkg/config"
 	"github.com/kube-burner/kube-burner/v2/pkg/measurements"
-	"github.com/kube-burner/kube-burner/v2/pkg/measurements/metrics"
 	"github.com/kube-burner/kube-burner/v2/pkg/measurements/types"
 	"github.com/kube-burner/kube-burner/v2/pkg/util/fileutils"
 	probing "github.com/prometheus-community/pro-bing"
@@ -55,9 +55,8 @@ import (
 // T4: Pod receives its CUDN IP address and enters Running state
 // T5: Pod becomes network-reachable (first successful ICMP ping)
 //
-// Measurements are keyed by BGPRouting name and include per-subnet latencies along with
-// aggregated statistics (min, max, avg, p99) for each timestamp. The T5_SuccessfulPings
-// metric counts how many pods were successfully pinged (one per subnet).
+// Measurements are keyed by BGPRouting name and hold, per timestamp, the latency of each of its subnets.
+// kube-burner aggregates them across BGPRoutings into one quantile per timestamp.
 // Azure exposes no Route Server FIB state, so T2 is recorded together with T3.
 const (
 	raLatencyBCCMeasurement          = "raLatencyBCCMeasurement"
@@ -69,20 +68,8 @@ const (
 )
 
 var (
-	maxTimeout        time.Duration = 1 * time.Minute
-	cloudProvider     string
 	routePollInterval time.Duration = 250 * time.Millisecond
 	pingInterval      time.Duration = 100 * time.Millisecond
-
-	// AWS-specific variables
-	awsRegion     string
-	routeServerId string
-	vpcId         string
-
-	// Azure-specific variables
-	azureSubscriptionId  string
-	azureResourceGroup   string
-	azureRouteServerName string
 
 	supportedRaLatencyBCCJobTypes = []config.JobType{config.CreationJob, config.PatchJob}
 
@@ -101,61 +88,8 @@ type raMetricBCC struct {
 	Name       string    `json:"bgpRoutingName"`
 	Metadata   any       `json:"metadata,omitempty"`
 	Subnets    []string  `json:"subnets"`
-
-	T0_NetworkCreatedLatency []float64 `json:"t0_networkCreatedLatency,omitempty"`
-	T0_MinLatency            int       `json:"t0_minLatency,omitempty"`
-	T0_MaxLatency            int       `json:"t0_maxLatency,omitempty"`
-	T0_AvgLatency            int       `json:"t0_avgLatency,omitempty"`
-	T0_P99Latency            int       `json:"t0_p99Latency,omitempty"`
-
-	T0_5_RACreatedLatency []float64 `json:"t0_5_raCreatedLatency,omitempty"`
-	T0_5_MinLatency       int       `json:"t0_5_minLatency,omitempty"`
-	T0_5_MaxLatency       int       `json:"t0_5_maxLatency,omitempty"`
-	T0_5_AvgLatency       int       `json:"t0_5_avgLatency,omitempty"`
-	T0_5_P99Latency       int       `json:"t0_5_p99Latency,omitempty"`
-
-	T1_RibLatency []float64 `json:"t1_ribLatency,omitempty"`
-	T1_MinLatency int       `json:"t1_minLatency,omitempty"`
-	T1_MaxLatency int       `json:"t1_maxLatency,omitempty"`
-	T1_AvgLatency int       `json:"t1_avgLatency,omitempty"`
-	T1_P99Latency int       `json:"t1_p99Latency,omitempty"`
-
-	T1_5_AllPeersLatency []float64 `json:"t1_5_allPeersLatency,omitempty"`
-	T1_5_MinLatency      int       `json:"t1_5_minLatency,omitempty"`
-	T1_5_MaxLatency      int       `json:"t1_5_maxLatency,omitempty"`
-	T1_5_AvgLatency      int       `json:"t1_5_avgLatency,omitempty"`
-	T1_5_P99Latency      int       `json:"t1_5_p99Latency,omitempty"`
-
-	T2_FibLatency []float64 `json:"t2_fibLatency,omitempty"`
-	T2_MinLatency int       `json:"t2_minLatency,omitempty"`
-	T2_MaxLatency int       `json:"t2_maxLatency,omitempty"`
-	T2_AvgLatency int       `json:"t2_avgLatency,omitempty"`
-	T2_P99Latency int       `json:"t2_p99Latency,omitempty"`
-
-	T3_VpcRouteTableLatency []float64 `json:"t3_vpcRouteTableLatency,omitempty"`
-	T3_MinLatency           int       `json:"t3_minLatency,omitempty"`
-	T3_MaxLatency           int       `json:"t3_maxLatency,omitempty"`
-	T3_AvgLatency           int       `json:"t3_avgLatency,omitempty"`
-	T3_P99Latency           int       `json:"t3_p99Latency,omitempty"`
-
-	T3_5_AllPeersLatency []float64 `json:"t3_5_allPeersLatency,omitempty"`
-	T3_5_MinLatency      int       `json:"t3_5_minLatency,omitempty"`
-	T3_5_MaxLatency      int       `json:"t3_5_maxLatency,omitempty"`
-	T3_5_AvgLatency      int       `json:"t3_5_avgLatency,omitempty"`
-	T3_5_P99Latency      int       `json:"t3_5_p99Latency,omitempty"`
-
-	T4_PodIPAssignedLatency []float64 `json:"t4_podIPAssignedLatency,omitempty"`
-	T4_MinLatency           int       `json:"t4_minLatency,omitempty"`
-	T4_MaxLatency           int       `json:"t4_maxLatency,omitempty"`
-	T4_AvgLatency           int       `json:"t4_avgLatency,omitempty"`
-	T4_P99Latency           int       `json:"t4_p99Latency,omitempty"`
-
-	T5_PingSuccessLatency []float64 `json:"t5_pingSuccessLatency,omitempty"`
-	T5_MinLatency         int       `json:"t5_minLatency,omitempty"`
-	T5_MaxLatency         int       `json:"t5_maxLatency,omitempty"`
-	T5_AvgLatency         int       `json:"t5_avgLatency,omitempty"`
-	T5_P99Latency         int       `json:"t5_p99Latency,omitempty"`
-	T5_SuccessfulPings    int       `json:"t5_successfulPings,omitempty"`
+	// Latencies holds, per timestamp (T0, T0_5, ... T5), the latency in ms of each subnet that reached it
+	Latencies map[string][]float64 `json:"latencies"`
 }
 
 // detectedRoute holds route detection timestamps for each subnet.
@@ -166,8 +100,8 @@ type detectedRoute struct {
 	t1_RibTimestamp   time.Time
 	t1_5_AllPeers     time.Time
 	t2_FibTimestamp   time.Time
-	t3_VpcTimestamp   time.Time
-	t3_5_AllPeers     time.Time
+	t3_RouteTable     time.Time
+	t3_5_AllTables    time.Time
 }
 
 // podMeasurement holds pod lifecycle timestamps.
@@ -194,6 +128,10 @@ type networkStatus struct {
 
 type raLatencyBCC struct {
 	measurements.BaseMeasurement
+
+	inputs        map[string]string // string input variables of the job's objects (cloud settings, maxTimeout)
+	cloudProvider string
+	maxTimeout    time.Duration
 
 	routeTimestamps    sync.Map   // key: subnet, value: *detectedRoute
 	routeMu            sync.Mutex // guards the fields of every *detectedRoute, written by several goroutines
@@ -247,22 +185,13 @@ func (r *raLatencyBCC) handleAdd(obj any) {
 	log.Debugf("BGPRouting %s (Subnets: %v) created at %v", bgpRoutingName, subnetsRaw, t.UTC())
 
 	r.Metrics.LoadOrStore(bgpRoutingName, raMetricBCC{
-		Name:                     bgpRoutingName,
-		Timestamp:                t.UTC(),
-		Subnets:                  subnetsRaw,
-		T0_NetworkCreatedLatency: []float64{},
-		T0_5_RACreatedLatency:    []float64{},
-		T1_RibLatency:            []float64{},
-		T1_5_AllPeersLatency:     []float64{},
-		T2_FibLatency:            []float64{},
-		T3_VpcRouteTableLatency:  []float64{},
-		T3_5_AllPeersLatency:     []float64{},
-		T4_PodIPAssignedLatency:  []float64{},
-		T5_PingSuccessLatency:    []float64{},
-		MetricName:               raLatencyBCCMeasurement,
-		UUID:                     r.Uuid,
-		Metadata:                 r.Metadata,
-		JobName:                  r.JobConfig.Name,
+		Name:       bgpRoutingName,
+		Timestamp:  t.UTC(),
+		Subnets:    subnetsRaw,
+		MetricName: raLatencyBCCMeasurement,
+		UUID:       r.Uuid,
+		Metadata:   r.Metadata,
+		JobName:    r.JobConfig.Name,
 	})
 }
 
@@ -415,7 +344,7 @@ func (r *raLatencyBCC) routeServerPending() bool {
 				return false
 			}
 			route := val.(*detectedRoute)
-			awaitingFIB := cloudProvider != cloudProviderAzure && route.t2_FibTimestamp.IsZero()
+			awaitingFIB := r.cloudProvider != cloudProviderAzure && route.t2_FibTimestamp.IsZero()
 			if route.t1_RibTimestamp.IsZero() || route.t1_5_AllPeers.IsZero() || awaitingFIB {
 				pending = true
 				return false
@@ -454,7 +383,7 @@ func (r *raLatencyBCC) worker(routeCh <-chan newRoute) {
 			if !update.AllSeen.IsZero() && route.t1_5_AllPeers.IsZero() {
 				route.t1_5_AllPeers = update.AllSeen
 				log.Debugf("T1.5: Route %s in RIB from all BGP peers at %v", subnet, update.AllSeen)
-				if !route.t3_5_AllPeers.IsZero() {
+				if !route.t3_5_AllTables.IsZero() {
 					atomic.AddUint64(&r.detectedRouteCount, 1)
 				}
 			}
@@ -472,8 +401,8 @@ func (r *raLatencyBCC) worker(routeCh <-chan newRoute) {
 	}
 }
 
-// vpcRouteTableWorker detects T3 (route appears in route table) by polling periodically and on demand.
-func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerProvider, routeTableCheckCh <-chan struct{}, routeTableResourceID string) {
+// routeTableWorker detects T3 (route appears in route table) by polling periodically and on demand.
+func (r *raLatencyBCC) routeTableWorker(routeProvider utils.BCCRouteServerProvider, routeTableCheckCh <-chan struct{}, routeTableResourceID string) {
 	defer r.wg.Done()
 
 	ticker := time.NewTicker(routePollInterval)
@@ -488,7 +417,7 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerPro
 			subnet := key.(string)
 			route := value.(*detectedRoute)
 
-			if route.t3_5_AllPeers.IsZero() && (cloudProvider == cloudProviderAzure || !route.t2_FibTimestamp.IsZero()) {
+			if route.t3_5_AllTables.IsZero() && (r.cloudProvider == cloudProviderAzure || !route.t2_FibTimestamp.IsZero()) {
 				pendingSubnets = append(pendingSubnets, subnet)
 			}
 			return true
@@ -499,7 +428,7 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerPro
 			return
 		}
 
-		// Single API call for all pending routes
+		// One provider call covers all pending subnets
 		found, err := routeProvider.CheckRouteTables(context.Background(), routeTableResourceID, pendingSubnets)
 		if err != nil {
 			log.Warnf("route table query failed: %v", err)
@@ -519,21 +448,21 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerPro
 				continue
 			}
 			route := val.(*detectedRoute)
-			if route.t3_VpcTimestamp.IsZero() {
-				if cloudProvider == cloudProviderAzure && route.t2_FibTimestamp.IsZero() {
+			if route.t3_RouteTable.IsZero() {
+				if r.cloudProvider == cloudProviderAzure && route.t2_FibTimestamp.IsZero() {
 					route.t2_FibTimestamp = status.FirstSeen
 				}
-				route.t3_VpcTimestamp = status.FirstSeen
+				route.t3_RouteTable = status.FirstSeen
 				log.Debugf("T3: Route %s found in route table at %v", subnet, status.FirstSeen)
 			}
-			if !status.AllSeen.IsZero() && route.t3_5_AllPeers.IsZero() {
+			if !status.AllSeen.IsZero() && route.t3_5_AllTables.IsZero() {
 				// On AWS, T3.5 comes from the route server's installation status and T3 from the route tables;
 				// never report the route in all route tables before it was seen in the first one
-				route.t3_5_AllPeers = status.AllSeen
-				if route.t3_5_AllPeers.Before(route.t3_VpcTimestamp) {
-					route.t3_5_AllPeers = route.t3_VpcTimestamp
+				route.t3_5_AllTables = status.AllSeen
+				if route.t3_5_AllTables.Before(route.t3_RouteTable) {
+					route.t3_5_AllTables = route.t3_RouteTable
 				}
-				log.Debugf("T3.5: Route %s found in all route tables at %v", subnet, route.t3_5_AllPeers)
+				log.Debugf("T3.5: Route %s found in all route tables at %v", subnet, route.t3_5_AllTables)
 				if !route.t1_5_AllPeers.IsZero() {
 					atomic.AddUint64(&r.detectedRouteCount, 1)
 				}
@@ -563,20 +492,20 @@ func (r *raLatencyBCC) startMonitoring() error {
 	var routeTableResourceID string
 	var err error
 
-	switch cloudProvider {
+	switch r.cloudProvider {
 	case "aws":
-		routeProvider, err = utils.NewBCCRouteServerObserver(awsRegion, routeServerId)
-		routeTableResourceID = vpcId
+		routeProvider, err = utils.NewBCCRouteServerObserver(r.inputs["awsRegion"], r.inputs["routeServerId"])
+		routeTableResourceID = r.inputs["vpcId"]
 		if err != nil {
 			return fmt.Errorf("failed to create Route Server provider: %w", err)
 		}
 	case cloudProviderAzure:
-		routeProvider, err = utils.NewAzureRouteServerProvider(azureSubscriptionId, azureResourceGroup, azureRouteServerName)
+		routeProvider, err = utils.NewAzureRouteServerProvider(r.inputs["azureSubscriptionId"], r.inputs["azureResourceGroup"], r.inputs["azureRouteServerName"])
 		if err != nil {
 			return fmt.Errorf("failed to create Route Server provider: %w", err)
 		}
 	default:
-		return fmt.Errorf("unsupported cloud provider: %s", cloudProvider)
+		return fmt.Errorf("unsupported cloud provider: %s", r.cloudProvider)
 	}
 
 	// Start observer goroutine to poll Route Server for route changes
@@ -595,7 +524,7 @@ func (r *raLatencyBCC) startMonitoring() error {
 	// Start route table worker (single worker for all routes)
 	log.Infof("Starting route table worker")
 	r.wg.Add(1)
-	go r.vpcRouteTableWorker(routeProvider, routeTableCheckCh, routeTableResourceID)
+	go r.routeTableWorker(routeProvider, routeTableCheckCh, routeTableResourceID)
 
 	// Initialize pod IP channel and start T4 ping worker
 	r.podIPCh = make(chan podIPNotification, 100)
@@ -828,7 +757,7 @@ func (r *raLatencyBCC) pingUntilReachable(podIP, subnet string) {
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
 
-	timeout := time.NewTimer(maxTimeout)
+	timeout := time.NewTimer(r.maxTimeout)
 	defer timeout.Stop()
 
 	for {
@@ -883,38 +812,24 @@ func subnetContainsIP(cidr, ip string) bool {
 	return network.Contains(parsedIP)
 }
 
-// setInputVars reads configuration from job template input variables.
+// setInputVars collects the string input variables of the job's objects and reads the cloud provider and maxTimeout.
 func (r *raLatencyBCC) setInputVars() {
-	var err error
+	r.inputs = map[string]string{}
 	for _, obj := range r.JobConfig.Objects {
-		if val, ok := obj.InputVars["maxTimeout"]; ok {
-			maxTimeout, err = time.ParseDuration(val.(string))
-			if err != nil {
-				log.Errorf("Failure parsing maxTimeout: %v", err)
+		for key, val := range obj.InputVars {
+			if str, ok := val.(string); ok {
+				r.inputs[key] = str
 			}
 		}
-		if val, ok := obj.InputVars["cloudProvider"]; ok {
-			cloudProvider = val.(string)
-		}
-		// AWS-specific variables
-		if val, ok := obj.InputVars["awsRegion"]; ok {
-			awsRegion = val.(string)
-		}
-		if val, ok := obj.InputVars["routeServerId"]; ok {
-			routeServerId = val.(string)
-		}
-		if val, ok := obj.InputVars["vpcId"]; ok {
-			vpcId = val.(string)
-		}
-		// Azure-specific variables
-		if val, ok := obj.InputVars["azureSubscriptionId"]; ok {
-			azureSubscriptionId = val.(string)
-		}
-		if val, ok := obj.InputVars["azureResourceGroup"]; ok {
-			azureResourceGroup = val.(string)
-		}
-		if val, ok := obj.InputVars["azureRouteServerName"]; ok {
-			azureRouteServerName = val.(string)
+	}
+	r.cloudProvider = r.inputs["cloudProvider"]
+	r.maxTimeout = time.Minute
+	if val, ok := r.inputs["maxTimeout"]; ok {
+		timeout, err := time.ParseDuration(val)
+		if err != nil {
+			log.Errorf("Failure parsing maxTimeout: %v", err)
+		} else {
+			r.maxTimeout = timeout
 		}
 	}
 }
@@ -947,7 +862,7 @@ func (r *raLatencyBCC) waitForCompletion(desiredCount uint64) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
-	timeoutTimer := time.NewTimer(maxTimeout)
+	timeoutTimer := time.NewTimer(r.maxTimeout)
 	defer timeoutTimer.Stop()
 
 	for {
@@ -987,211 +902,62 @@ func (r *raLatencyBCC) Stop() error {
 	return r.StopMeasurement(r.normalizeMetrics, r.getLatency)
 }
 
+// milestone is one reported timestamp of a subnet; name is its latency and quantile key.
+type milestone struct {
+	name string
+	at   time.Time
+}
+
+// milestones returns a subnet's timestamps in reporting order.
+func milestones(route detectedRoute, pod podMeasurement) []milestone {
+	return []milestone{
+		{"T0", route.t0_NetworkCreated},
+		{"T0_5", route.t0_5_RACreated},
+		{"T1", route.t1_RibTimestamp},
+		{"T1_5", route.t1_5_AllPeers},
+		{"T2", route.t2_FibTimestamp},
+		{"T3", route.t3_RouteTable},
+		{"T3_5", route.t3_5_AllTables},
+		{"T4", pod.t4_PodIPAssigned},
+		{"T5", pod.t5_PingSuccess},
+	}
+}
+
+// normalizeMetrics converts each subnet's timestamps into latencies relative to its BGPRouting's creation.
 func (r *raLatencyBCC) normalizeMetrics() float64 {
 	var subnets, pings int
-	r.Metrics.Range(func(key, value any) bool {
+	r.Metrics.Range(func(_, value any) bool {
 		m := value.(raMetricBCC)
-
-		// For each subnet advertised by this BGPRouting, check if we detected it in the Route Server
+		m.Latencies = map[string][]float64{}
 		for _, subnet := range m.Subnets {
-			val, exists := r.routeTimestamps.Load(subnet)
-			if !exists {
-				log.Warnf("BGPRouting %s advertised subnet %s but it was never detected", m.Name, subnet)
-				continue
+			var route detectedRoute
+			if val, ok := r.routeTimestamps.Load(subnet); ok {
+				r.routeMu.Lock()
+				route = *val.(*detectedRoute)
+				r.routeMu.Unlock()
+			}
+			var pod podMeasurement
+			if val, ok := r.podTimestamps.Load(subnet); ok {
+				pod = *val.(*podMeasurement)
 			}
 
-			r.routeMu.Lock()
-			routeVal := *val.(*detectedRoute)
-			r.routeMu.Unlock()
-
-			// Calculate T0 latency (CUDN created)
-			if !routeVal.t0_NetworkCreated.IsZero() {
-				latencyMs := float64(routeVal.t0_NetworkCreated.Sub(m.Timestamp).Milliseconds())
-				m.T0_NetworkCreatedLatency = append(m.T0_NetworkCreatedLatency, latencyMs)
-				log.Debugf("T0: BGPRouting %s subnet %s network created latency: %.0f ms", m.Name, subnet, latencyMs)
-			} else {
-				log.Debugf("BGPRouting %s advertised subnet %s but NetworkCreated was never observed (T0 unavailable)", m.Name, subnet)
-			}
-
-			// Calculate T0.5 latency (RouteAdvertisements created)
-			if !routeVal.t0_5_RACreated.IsZero() {
-				latencyMs := float64(routeVal.t0_5_RACreated.Sub(m.Timestamp).Milliseconds())
-				m.T0_5_RACreatedLatency = append(m.T0_5_RACreatedLatency, latencyMs)
-				log.Debugf("T0.5: BGPRouting %s subnet %s RouteAdvertisements created latency: %.0f ms", m.Name, subnet, latencyMs)
-			} else {
-				log.Debugf("BGPRouting %s advertised subnet %s but RouteAdvertisementsCreated was never observed (T0.5 unavailable)", m.Name, subnet)
-			}
-
-			// Calculate T1 latency (RIB)
-			if !routeVal.t1_RibTimestamp.IsZero() {
-				latencyMs := float64(routeVal.t1_RibTimestamp.Sub(m.Timestamp).Milliseconds())
-				m.T1_RibLatency = append(m.T1_RibLatency, latencyMs)
-				log.Debugf("T1: BGPRouting %s subnet %s RIB latency: %.0f ms", m.Name, subnet, latencyMs)
-			} else {
-				log.Warnf("BGPRouting %s advertised subnet %s but it was never detected in RIB", m.Name, subnet)
-			}
-
-			// Calculate T1.5 latency (RIB from all BGP peers)
-			if !routeVal.t1_5_AllPeers.IsZero() {
-				latencyMs := float64(routeVal.t1_5_AllPeers.Sub(m.Timestamp).Milliseconds())
-				m.T1_5_AllPeersLatency = append(m.T1_5_AllPeersLatency, latencyMs)
-				log.Debugf("T1.5: BGPRouting %s subnet %s RIB from all peers latency: %.0f ms", m.Name, subnet, latencyMs)
-			} else {
-				log.Warnf("BGPRouting %s advertised subnet %s but it was never learned from all BGP peers", m.Name, subnet)
-			}
-
-			// Calculate T2 latency (FIB)
-			if !routeVal.t2_FibTimestamp.IsZero() {
-				latencyMs := float64(routeVal.t2_FibTimestamp.Sub(m.Timestamp).Milliseconds())
-				m.T2_FibLatency = append(m.T2_FibLatency, latencyMs)
-				log.Debugf("T2: BGPRouting %s subnet %s FIB latency: %.0f ms", m.Name, subnet, latencyMs)
-			} else {
-				log.Warnf("BGPRouting %s advertised subnet %s but it was never detected in FIB", m.Name, subnet)
-			}
-
-			// Calculate T3 latency (route table)
-			if !routeVal.t3_VpcTimestamp.IsZero() {
-				latencyMs := float64(routeVal.t3_VpcTimestamp.Sub(m.Timestamp).Milliseconds())
-				m.T3_VpcRouteTableLatency = append(m.T3_VpcRouteTableLatency, latencyMs)
-				log.Debugf("T3: BGPRouting %s subnet %s route table latency: %.0f ms", m.Name, subnet, latencyMs)
-			} else {
-				log.Warnf("BGPRouting %s advertised subnet %s but it was never detected in route table", m.Name, subnet)
-			}
-
-			// Calculate T3.5 latency (all route tables)
-			if !routeVal.t3_5_AllPeers.IsZero() {
-				latencyMs := float64(routeVal.t3_5_AllPeers.Sub(m.Timestamp).Milliseconds())
-				m.T3_5_AllPeersLatency = append(m.T3_5_AllPeersLatency, latencyMs)
-				log.Debugf("T3.5: BGPRouting %s subnet %s all peers latency: %.0f ms", m.Name, subnet, latencyMs)
-			} else {
-				log.Warnf("BGPRouting %s advertised subnet %s but it never reached all route tables", m.Name, subnet)
-			}
-
-			// Calculate T4 and T5 latencies from pod measurements
-			podVal, podExists := r.podTimestamps.Load(subnet)
-			if podExists {
-				podMeas := podVal.(*podMeasurement)
-
-				// T4: Pod IP assigned (relative to BGPRouting creation)
-				if !podMeas.t4_PodIPAssigned.IsZero() {
-					latencyMs := float64(podMeas.t4_PodIPAssigned.Sub(m.Timestamp).Milliseconds())
-					m.T4_PodIPAssignedLatency = append(m.T4_PodIPAssignedLatency, latencyMs)
-					log.Debugf("T4: BGPRouting %s subnet %s pod IP %s assigned latency: %.0f ms", m.Name, subnet, podMeas.podIP, latencyMs)
+			var recorded, missing []string
+			for _, ms := range milestones(route, pod) {
+				if ms.at.IsZero() {
+					missing = append(missing, ms.name)
+					continue
 				}
-
-				// T5: Ping success (relative to BGPRouting creation)
-				if !podMeas.t5_PingSuccess.IsZero() {
-					latencyMs := float64(podMeas.t5_PingSuccess.Sub(m.Timestamp).Milliseconds())
-					m.T5_PingSuccessLatency = append(m.T5_PingSuccessLatency, latencyMs)
-					log.Debugf("T5: BGPRouting %s subnet %s pod IP %s ping success latency: %.0f ms", m.Name, subnet, podMeas.podIP, latencyMs)
-				}
-			} else {
-				log.Warnf("BGPRouting %s advertised subnet %s but no pod was found", m.Name, subnet)
+				latency := float64(ms.at.Sub(m.Timestamp).Milliseconds())
+				m.Latencies[ms.name] = append(m.Latencies[ms.name], latency)
+				recorded = append(recorded, fmt.Sprintf("%s=%.0fms", ms.name, latency))
+			}
+			log.Debugf("BGPRouting %s subnet %s: %s", m.Name, subnet, strings.Join(recorded, " "))
+			if len(missing) > 0 {
+				log.Warnf("BGPRouting %s subnet %s: no %s recorded", m.Name, subnet, strings.Join(missing, ", "))
 			}
 		}
-
-		// Calculate T0 statistics
-		if len(m.T0_NetworkCreatedLatency) > 0 {
-			t0Summary := metrics.NewLatencySummary(m.T0_NetworkCreatedLatency, m.Name+"-T0")
-			m.T0_MinLatency = t0Summary.Min
-			m.T0_MaxLatency = t0Summary.Max
-			m.T0_AvgLatency = t0Summary.Avg
-			m.T0_P99Latency = t0Summary.P99
-			log.Debugf("T0 (Network Created) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
-				m.Name, t0Summary.Min, t0Summary.Max, t0Summary.Avg, t0Summary.P99)
-		}
-
-		// Calculate T0.5 statistics
-		if len(m.T0_5_RACreatedLatency) > 0 {
-			t05Summary := metrics.NewLatencySummary(m.T0_5_RACreatedLatency, m.Name+"-T0.5")
-			m.T0_5_MinLatency = t05Summary.Min
-			m.T0_5_MaxLatency = t05Summary.Max
-			m.T0_5_AvgLatency = t05Summary.Avg
-			m.T0_5_P99Latency = t05Summary.P99
-			log.Debugf("T0.5 (RouteAdvertisements Created) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
-				m.Name, t05Summary.Min, t05Summary.Max, t05Summary.Avg, t05Summary.P99)
-		}
-
-		// Calculate T1 statistics
-		if len(m.T1_RibLatency) > 0 {
-			t1Summary := metrics.NewLatencySummary(m.T1_RibLatency, m.Name+"-T1")
-			m.T1_MinLatency = t1Summary.Min
-			m.T1_MaxLatency = t1Summary.Max
-			m.T1_AvgLatency = t1Summary.Avg
-			m.T1_P99Latency = t1Summary.P99
-			log.Debugf("T1 (RIB) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
-				m.Name, t1Summary.Min, t1Summary.Max, t1Summary.Avg, t1Summary.P99)
-		}
-
-		// Calculate T1.5 statistics
-		if len(m.T1_5_AllPeersLatency) > 0 {
-			t15Summary := metrics.NewLatencySummary(m.T1_5_AllPeersLatency, m.Name+"-T1.5")
-			m.T1_5_MinLatency = t15Summary.Min
-			m.T1_5_MaxLatency = t15Summary.Max
-			m.T1_5_AvgLatency = t15Summary.Avg
-			m.T1_5_P99Latency = t15Summary.P99
-			log.Debugf("T1.5 (RIB All Peers) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
-				m.Name, t15Summary.Min, t15Summary.Max, t15Summary.Avg, t15Summary.P99)
-		}
-
-		// Calculate T2 statistics
-		if len(m.T2_FibLatency) > 0 {
-			t2Summary := metrics.NewLatencySummary(m.T2_FibLatency, m.Name+"-T2")
-			m.T2_MinLatency = t2Summary.Min
-			m.T2_MaxLatency = t2Summary.Max
-			m.T2_AvgLatency = t2Summary.Avg
-			m.T2_P99Latency = t2Summary.P99
-			log.Debugf("T2 (FIB) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
-				m.Name, t2Summary.Min, t2Summary.Max, t2Summary.Avg, t2Summary.P99)
-		}
-
-		// Calculate T3 statistics
-		if len(m.T3_VpcRouteTableLatency) > 0 {
-			t3Summary := metrics.NewLatencySummary(m.T3_VpcRouteTableLatency, m.Name+"-T3")
-			m.T3_MinLatency = t3Summary.Min
-			m.T3_MaxLatency = t3Summary.Max
-			m.T3_AvgLatency = t3Summary.Avg
-			m.T3_P99Latency = t3Summary.P99
-			log.Debugf("T3 (Route Table) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
-				m.Name, t3Summary.Min, t3Summary.Max, t3Summary.Avg, t3Summary.P99)
-		}
-
-		// Calculate T3.5 statistics
-		if len(m.T3_5_AllPeersLatency) > 0 {
-			t35Summary := metrics.NewLatencySummary(m.T3_5_AllPeersLatency, m.Name+"-T3.5")
-			m.T3_5_MinLatency = t35Summary.Min
-			m.T3_5_MaxLatency = t35Summary.Max
-			m.T3_5_AvgLatency = t35Summary.Avg
-			m.T3_5_P99Latency = t35Summary.P99
-			log.Debugf("T3.5 (All Route Tables) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
-				m.Name, t35Summary.Min, t35Summary.Max, t35Summary.Avg, t35Summary.P99)
-		}
-
-		// Calculate T4 statistics
-		if len(m.T4_PodIPAssignedLatency) > 0 {
-			t4Summary := metrics.NewLatencySummary(m.T4_PodIPAssignedLatency, m.Name+"-T4")
-			m.T4_MinLatency = t4Summary.Min
-			m.T4_MaxLatency = t4Summary.Max
-			m.T4_AvgLatency = t4Summary.Avg
-			m.T4_P99Latency = t4Summary.P99
-			log.Debugf("T4 (Pod IP Assigned) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
-				m.Name, t4Summary.Min, t4Summary.Max, t4Summary.Avg, t4Summary.P99)
-		}
-
-		// Calculate T5 statistics
-		if len(m.T5_PingSuccessLatency) > 0 {
-			t5Summary := metrics.NewLatencySummary(m.T5_PingSuccessLatency, m.Name+"-T5")
-			m.T5_MinLatency = t5Summary.Min
-			m.T5_MaxLatency = t5Summary.Max
-			m.T5_AvgLatency = t5Summary.Avg
-			m.T5_P99Latency = t5Summary.P99
-			m.T5_SuccessfulPings = len(m.T5_PingSuccessLatency)
-			log.Debugf("T5 (Ping Success) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms, Successful: %d",
-				m.Name, t5Summary.Min, t5Summary.Max, t5Summary.Avg, t5Summary.P99, m.T5_SuccessfulPings)
-		}
-
 		subnets += len(m.Subnets)
-		pings += m.T5_SuccessfulPings
+		pings += len(m.Latencies["T5"])
 		r.NormLatencies = append(r.NormLatencies, m)
 		return true
 	})
@@ -1199,25 +965,17 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 	return 0
 }
 
-// getLatency reports one latency per timestamp for each BGPRouting (the average over its subnets),
-// leaving out timestamps that were not collected. kube-burner aggregates these across BGPRoutings.
+// getLatency reports, per timestamp, the average latency over the BGPRouting's subnets.
+// kube-burner aggregates these across BGPRoutings into the quantiles.
 func (r *raLatencyBCC) getLatency(normLatency any) map[string]float64 {
-	m := normLatency.(raMetricBCC)
 	latencies := map[string]float64{}
-	add := func(name string, samples []float64, avg int) {
-		if len(samples) > 0 {
-			latencies[name] = float64(avg)
+	for name, samples := range normLatency.(raMetricBCC).Latencies {
+		var sum float64
+		for _, latency := range samples {
+			sum += latency
 		}
+		latencies[name] = sum / float64(len(samples))
 	}
-	add("T0", m.T0_NetworkCreatedLatency, m.T0_AvgLatency)
-	add("T0_5", m.T0_5_RACreatedLatency, m.T0_5_AvgLatency)
-	add("T1", m.T1_RibLatency, m.T1_AvgLatency)
-	add("T1_5", m.T1_5_AllPeersLatency, m.T1_5_AvgLatency)
-	add("T2", m.T2_FibLatency, m.T2_AvgLatency)
-	add("T3", m.T3_VpcRouteTableLatency, m.T3_AvgLatency)
-	add("T3_5", m.T3_5_AllPeersLatency, m.T3_5_AvgLatency)
-	add("T4", m.T4_PodIPAssignedLatency, m.T4_AvgLatency)
-	add("T5", m.T5_PingSuccessLatency, m.T5_AvgLatency)
 	return latencies
 }
 
