@@ -153,10 +153,8 @@ func (o *BCCRouteServerObserver) GetRoutes(ctx context.Context) ([]RouteInfo, er
 }
 
 // CheckRouteTables checks which subnets are present in VPC route tables.
-// resourceID must be the VPC ID.
-func (o *BCCRouteServerObserver) CheckRouteTables(ctx context.Context, resourceID string, subnets []string) (map[string]RouteTableStatus, error) {
-	vpcId := resourceID
-	if vpcId == "" {
+func (o *BCCRouteServerObserver) CheckRouteTables(ctx context.Context, vpcID string, subnets []string) (map[string]RouteTableStatus, error) {
+	if vpcID == "" {
 		return nil, fmt.Errorf("VPC ID not configured")
 	}
 
@@ -164,7 +162,7 @@ func (o *BCCRouteServerObserver) CheckRouteTables(ctx context.Context, resourceI
 		Filters: []ec2types.Filter{
 			{
 				Name:   aws.String("vpc-id"),
-				Values: []string{vpcId},
+				Values: []string{vpcID},
 			},
 		},
 	}

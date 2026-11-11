@@ -94,7 +94,6 @@ type raMetricBCC struct {
 
 // detectedRoute holds route detection timestamps for each subnet.
 type detectedRoute struct {
-	subnet            string
 	t0_NetworkCreated time.Time
 	t0_5_RACreated    time.Time
 	t1_RibTimestamp   time.Time
@@ -106,16 +105,13 @@ type detectedRoute struct {
 
 // podMeasurement holds pod lifecycle timestamps.
 type podMeasurement struct {
-	podIP            string
-	subnet           string
 	t4_PodIPAssigned time.Time
 	t5_PingSuccess   time.Time
 }
 
 type podIPNotification struct {
-	subnet    string
-	podIP     string
-	timestamp time.Time
+	subnet string
+	podIP  string
 }
 
 // networkStatus represents a network interface from the k8s.v1.cni.cncf.io/network-status annotation.
@@ -142,6 +138,7 @@ type raLatencyBCC struct {
 	wg                 sync.WaitGroup
 	podIPCh            chan podIPNotification
 	connector          k8sconnector.K8SConnector
+	informerStopCh     chan struct{} // stops the BGPRouting and pod watchers
 }
 
 type raLatencyBCCMeasurementFactory struct {
@@ -211,7 +208,7 @@ func (r *raLatencyBCC) handleBGPRoutingUpdate(_, newObj any) {
 			continue
 		}
 		for _, subnet := range subnets {
-			val, _ := r.routeTimestamps.LoadOrStore(subnet, &detectedRoute{subnet: subnet})
+			val, _ := r.routeTimestamps.LoadOrStore(subnet, &detectedRoute{})
 			route := val.(*detectedRoute)
 			switch cond["type"] {
 			case conditionNetworkCreated:
@@ -229,105 +226,95 @@ func (r *raLatencyBCC) handleBGPRoutingUpdate(_, newObj any) {
 	}
 }
 
-type newRoute struct {
-	Dst     string
-	Ts      time.Time
-	InFIB   bool
-	AllSeen time.Time // when every BGP peer had the route (T1.5)
-}
-
-func (r *raLatencyBCC) observerWorker(routeProvider utils.BCCRouteServerProvider, routeCh chan<- newRoute, baselineReadCh chan<- struct{}, routeTableCheckCh chan<- struct{}) {
+// routeServerWorker polls the Route Server and records T1, T1.5 and T2. Routes already present in the
+// baseline read predate the measurement and are ignored until they disappear.
+func (r *raLatencyBCC) routeServerWorker(routeProvider utils.BCCRouteServerProvider, baselineReadCh chan<- struct{}, routeTableCheckCh chan<- struct{}) {
 	defer r.wg.Done()
 
-	baselineRead := false
-	currentSubnets := make(map[string]bool)
-	currentFibState := make(map[string]bool)
-	allPeersReported := make(map[string]bool) // T1.5 already sent, or route present at baseline
-
-	read := func() {
+	baseline := map[string]bool{}
+	read := func(isBaseline bool) {
 		routes, err := routeProvider.GetRoutes(context.Background())
 		if err != nil {
 			log.Warnf("BCC Route Server query failed: %v", err)
 			return
 		}
-
 		now := time.Now().UTC()
-		fetchedSubnets := make(map[string]bool)
-		fetchedFibState := make(map[string]bool)
+		present := map[string]bool{}
 
+		r.routeMu.Lock()
+		defer r.routeMu.Unlock()
 		for _, route := range routes {
-			subnetString := route.Prefix
-			inFIB := route.InFIB
-			// Providers that stamp each peer (Azure) report when the route was first seen; otherwise use the poll time
-			ts := now
-			if !route.FirstSeen.IsZero() {
-				ts = route.FirstSeen
+			present[route.Prefix] = true
+			if isBaseline {
+				baseline[route.Prefix] = true
+				continue
 			}
-
-			fetchedSubnets[subnetString] = true
-			fetchedFibState[subnetString] = inFIB
-
-			wasInRib := currentSubnets[subnetString]
-			wasFibActive := currentFibState[subnetString]
-
-			if !wasInRib {
-				// New route detected (T1)
-				currentSubnets[subnetString] = true
-				currentFibState[subnetString] = inFIB
-				if baselineRead {
-					log.Debugf("New route detected: %s (inFIB: %v)", subnetString, inFIB)
-					routeCh <- newRoute{Dst: subnetString, Ts: ts, InFIB: inFIB}
-				} else {
-					log.Debugf("Baseline route detected: %s", subnetString)
-					allPeersReported[subnetString] = true
-				}
-			} else if baselineRead && !wasFibActive && inFIB {
-				// FIB state changed from false to true (T2)
-				currentFibState[subnetString] = inFIB
-				log.Debugf("Route FIB state changed: %s now in-fib", subnetString)
-				routeCh <- newRoute{Dst: subnetString, Ts: now, InFIB: inFIB}
-
-				// Notify route table worker to check immediately (non-blocking)
+			if baseline[route.Prefix] {
+				continue
+			}
+			if r.recordRouteServer(route, now) {
+				// T2 just set: let the route table worker check right away (non-blocking)
 				select {
 				case routeTableCheckCh <- struct{}{}:
 				default:
 				}
 			}
-
-			if !route.AllSeen.IsZero() && !allPeersReported[subnetString] {
-				allPeersReported[subnetString] = true
-				routeCh <- newRoute{Dst: subnetString, Ts: ts, InFIB: inFIB, AllSeen: route.AllSeen}
-			}
 		}
-
-		// Remove subnets that are no longer present in the fetched routes
-		for subnet := range currentSubnets {
-			if !fetchedSubnets[subnet] {
-				delete(currentSubnets, subnet)
-				delete(currentFibState, subnet)
-				log.Debugf("Route removed: %s", subnet)
+		for prefix := range baseline {
+			if !present[prefix] {
+				delete(baseline, prefix)
 			}
 		}
 	}
 
-	read() // Initial read to establish baseline
-	baselineRead = true
+	read(true)
 	log.Debugf("Baseline read complete, monitoring for new routes...")
 	close(baselineReadCh)
 
 	ticker := time.NewTicker(routePollInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ticker.C:
 			if r.routeServerPending() {
-				read()
+				read(false)
 			}
 		case <-r.doneCh:
 			return
 		}
 	}
+}
+
+// recordRouteServer records T1, T1.5 and T2 for a route seen in the Route Server and reports whether T2 was
+// just set. Providers that stamp each peer report when the route was first seen; otherwise the poll time is used.
+// Callers hold routeMu.
+func (r *raLatencyBCC) recordRouteServer(route utils.RouteInfo, now time.Time) bool {
+	val, _ := r.routeTimestamps.LoadOrStore(route.Prefix, &detectedRoute{})
+	d := val.(*detectedRoute)
+
+	if d.t1_RibTimestamp.IsZero() {
+		d.t1_RibTimestamp = now
+		if !route.FirstSeen.IsZero() {
+			d.t1_RibTimestamp = route.FirstSeen
+		}
+		log.Debugf("T1: Route %s in RIB at %v", route.Prefix, d.t1_RibTimestamp)
+	}
+
+	// A route completes once it has both T1.5 and T3.5, which come from independent queries
+	if !route.AllSeen.IsZero() && d.t1_5_AllPeers.IsZero() {
+		d.t1_5_AllPeers = route.AllSeen
+		log.Debugf("T1.5: Route %s in RIB from all BGP peers at %v", route.Prefix, route.AllSeen)
+		if !d.t3_5_AllTables.IsZero() {
+			atomic.AddUint64(&r.detectedRouteCount, 1)
+		}
+	}
+
+	if route.InFIB && d.t2_FibTimestamp.IsZero() {
+		d.t2_FibTimestamp = now
+		log.Debugf("T2: Route %s in FIB at %v", route.Prefix, now)
+		return true
+	}
+	return false
 }
 
 // routeServerPending reports whether any BGPRouting subnet still needs a Route Server observation:
@@ -353,52 +340,6 @@ func (r *raLatencyBCC) routeServerPending() bool {
 		return true
 	})
 	return pending
-}
-
-// worker records T1 (RIB) and T2 (FIB) timestamps as routes are advertised to Route Server.
-func (r *raLatencyBCC) worker(routeCh <-chan newRoute) {
-	defer r.wg.Done()
-	for {
-		select {
-		case update, ok := <-routeCh:
-			if !ok {
-				return
-			}
-
-			subnet := update.Dst
-			now := update.Ts
-
-			r.routeMu.Lock()
-			val, _ := r.routeTimestamps.LoadOrStore(subnet, &detectedRoute{subnet: subnet})
-			route := val.(*detectedRoute)
-
-			// T1: Route first appears in RIB
-			if route.t1_RibTimestamp.IsZero() {
-				route.t1_RibTimestamp = now
-				log.Debugf("T1: Route %s in RIB at %v", subnet, now)
-			}
-
-			// T1.5: route learned from every BGP peer. A route completes once it has both T1.5 and T3.5,
-			// which come from independent queries; whichever arrives second completes it.
-			if !update.AllSeen.IsZero() && route.t1_5_AllPeers.IsZero() {
-				route.t1_5_AllPeers = update.AllSeen
-				log.Debugf("T1.5: Route %s in RIB from all BGP peers at %v", subnet, update.AllSeen)
-				if !route.t3_5_AllTables.IsZero() {
-					atomic.AddUint64(&r.detectedRouteCount, 1)
-				}
-			}
-
-			// T2: Route becomes in-fib (state = active)
-			if update.InFIB && route.t2_FibTimestamp.IsZero() {
-				route.t2_FibTimestamp = now
-				log.Debugf("T2: Route %s in FIB at %v", subnet, now)
-			}
-			r.routeMu.Unlock()
-
-		case <-r.doneCh:
-			return
-		}
-	}
 }
 
 // routeTableWorker detects T3 (route appears in route table) by polling periodically and on demand.
@@ -508,37 +449,27 @@ func (r *raLatencyBCC) startMonitoring() error {
 		return fmt.Errorf("unsupported cloud provider: %s", r.cloudProvider)
 	}
 
-	// Start observer goroutine to poll Route Server for route changes
-	routeCh := make(chan newRoute, 1000)
 	baselineReadCh := make(chan struct{})
-	routeTableCheckCh := make(chan struct{}, 100) // Buffered channel for route table check notifications
-
+	routeTableCheckCh := make(chan struct{}, 100)
 	r.wg.Add(1)
-	go r.observerWorker(routeProvider, routeCh, baselineReadCh, routeTableCheckCh)
-	<-baselineReadCh // wait for baseline read to complete before starting workers
+	go r.routeServerWorker(routeProvider, baselineReadCh, routeTableCheckCh)
+	<-baselineReadCh // routes present before the BGPRoutings are created must not count as detected
 
-	// Start worker goroutine that may in the future do more than just record timestamps
-	r.wg.Add(1)
-	go r.worker(routeCh)
-
-	// Start route table worker (single worker for all routes)
 	log.Infof("Starting route table worker")
 	r.wg.Add(1)
 	go r.routeTableWorker(routeProvider, routeTableCheckCh, routeTableResourceID)
 
-	// Initialize pod IP channel and start T4 ping worker
 	r.podIPCh = make(chan podIPNotification, 100)
 	r.wg.Add(1)
-	go r.t4PingWorker()
-	log.Infof("Started T4 ping worker")
+	go r.pingWorker()
 
 	log.Infof("Creating BGPRouting and Pod watchers for %s", r.JobConfig.Name)
 	connector, err := k8sconnector.NewK8SConnector(r.RestConfig)
 	if err != nil {
-		log.Error(err)
-		return err
+		return fmt.Errorf("creating Kubernetes connector: %w", err)
 	}
 	r.connector = connector
+	r.informerStopCh = make(chan struct{})
 
 	// BGPRouting informer: creation timestamp, plus T0/T0.5 from status conditions
 	bgpRoutingFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(r.connector.DynamicClient(), time.Minute, metav1.NamespaceAll, nil)
@@ -548,9 +479,8 @@ func (r *raLatencyBCC) startMonitoring() error {
 		UpdateFunc: r.handleBGPRoutingUpdate,
 	})
 
-	stopCh := make(chan struct{})
-	bgpRoutingFactory.Start(stopCh)
-	bgpRoutingFactory.WaitForCacheSync(stopCh)
+	bgpRoutingFactory.Start(r.informerStopCh)
+	bgpRoutingFactory.WaitForCacheSync(r.informerStopCh)
 
 	// Pod informer (filtered by kube-burner labels)
 	podGVR := schema.GroupVersionResource{
@@ -568,13 +498,11 @@ func (r *raLatencyBCC) startMonitoring() error {
 	)
 	podInformer := podFactory.ForResource(podGVR).Informer()
 	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    r.handlePodAdd,
-		UpdateFunc: r.handlePodUpdate,
+		AddFunc:    r.handlePodEvent,
+		UpdateFunc: func(_, newObj any) { r.handlePodEvent(newObj) },
 	})
-
-	stopCh = make(chan struct{})
-	podFactory.Start(stopCh)
-	podFactory.WaitForCacheSync(stopCh)
+	podFactory.Start(r.informerStopCh)
+	podFactory.WaitForCacheSync(r.informerStopCh)
 
 	return nil
 }
@@ -598,72 +526,34 @@ func getCUDNIP(pod *unstructured.Unstructured) (string, bool) {
 		return "", false
 	}
 
-	// Find the CUDN interface (typically ovn-udn* and marked as default)
+	// The CUDN interface is the first one besides eth0 that has an IP (typically ovn-udn*)
 	for _, network := range networks {
-		// Look for interface named ovn-udn* or marked as default (but not eth0)
-		if network.Interface != "eth0" && (network.Default || len(network.IPs) > 0) {
-			if len(network.IPs) > 0 {
-				// Extract just the IP address (remove /prefix if present)
-				ip := network.IPs[0]
-				// Remove CIDR notation if present (e.g., "40.0.0.4/16" -> "40.0.0.4")
-				for i := 0; i < len(ip); i++ {
-					if ip[i] == '/' {
-						ip = ip[:i]
-						break
-					}
-				}
-				log.Debugf("Found CUDN IP %s on interface %s", ip, network.Interface)
-				return ip, true
-			}
+		if network.Interface == "eth0" || len(network.IPs) == 0 {
+			continue
 		}
+		ip, _, _ := strings.Cut(network.IPs[0], "/") // e.g. "40.0.0.4/16" -> "40.0.0.4"
+		log.Debugf("Found CUDN IP %s on interface %s", ip, network.Interface)
+		return ip, true
 	}
 
 	return "", false
 }
 
-// recordT4 stores the T4 timestamp and notifies the ping worker.
+// recordT4 stores T4 the first time the subnet's pod is running with its CUDN IP, and starts pinging it.
+// Later events for the same pod (updates, watcher resyncs) are ignored.
 func (r *raLatencyBCC) recordT4(subnet, podIP string, assignedTime time.Time) {
-	// Load or create pod measurement keyed by subnet
-	val, loaded := r.podTimestamps.LoadOrStore(subnet, &podMeasurement{
-		podIP:            podIP,
-		subnet:           subnet,
-		t4_PodIPAssigned: assignedTime,
-	})
-
-	podMeas := val.(*podMeasurement)
-
-	// If already loaded and T4 is already set, don't overwrite
-	if loaded && !podMeas.t4_PodIPAssigned.IsZero() {
-		log.Debugf("T4: Pod IP %s already recorded for subnet %s, skipping duplicate event", podIP, subnet)
+	if _, loaded := r.podTimestamps.LoadOrStore(subnet, &podMeasurement{t4_PodIPAssigned: assignedTime}); loaded {
 		return
 	}
-
-	// First time recording T4 for this subnet
-	if !loaded {
-		log.Debugf("T4: Pod IP %s assigned from subnet %s at %v", podIP, subnet, assignedTime)
-
-		// Send to ping worker
-		select {
-		case r.podIPCh <- podIPNotification{
-			subnet:    subnet,
-			podIP:     podIP,
-			timestamp: assignedTime,
-		}:
-		default:
-			log.Warnf("Pod IP channel full, dropping notification for %s", podIP)
-		}
+	log.Debugf("T4: Pod IP %s assigned from subnet %s at %v", podIP, subnet, assignedTime)
+	select {
+	case r.podIPCh <- podIPNotification{subnet: subnet, podIP: podIP}:
+	default:
+		log.Warnf("Pod IP channel full, dropping notification for %s", podIP)
 	}
 }
 
-// handlePodAdd tracks pods that reach Running state with an assigned IP.
-func (r *raLatencyBCC) handlePodAdd(obj any) {
-	r.handlePodEvent(obj)
-}
-
-func (r *raLatencyBCC) handlePodUpdate(oldObj, newObj any) {
-	r.handlePodEvent(newObj)
-}
-
+// handlePodEvent records T4 for pods that reach Running state with a CUDN IP.
 func (r *raLatencyBCC) handlePodEvent(obj any) {
 	pod := obj.(*unstructured.Unstructured)
 
@@ -701,23 +591,14 @@ func (r *raLatencyBCC) handlePodEvent(obj any) {
 	}
 }
 
-// t4PingWorker dispatches ping goroutines for each pod and records T5 timestamps.
-func (r *raLatencyBCC) t4PingWorker() {
+// pingWorker starts a ping goroutine for each pod that reached T4; the pings record T5.
+func (r *raLatencyBCC) pingWorker() {
 	defer r.wg.Done()
-
-	pingingIPs := make(map[string]bool)
-
 	for {
 		select {
 		case notification := <-r.podIPCh:
-			if pingingIPs[notification.podIP] {
-				continue
-			}
-
-			pingingIPs[notification.podIP] = true
 			r.wg.Add(1)
 			go r.pingUntilReachable(notification.podIP, notification.subnet)
-
 		case <-r.doneCh:
 			return
 		}
@@ -897,6 +778,7 @@ func (r *raLatencyBCC) Stop() error {
 	r.waitForCompletion(desiredCount)
 
 	close(r.doneCh)
+	close(r.informerStopCh)
 	r.wg.Wait()
 
 	return r.StopMeasurement(r.normalizeMetrics, r.getLatency)
