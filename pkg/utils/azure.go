@@ -215,12 +215,14 @@ func (p *AzureRouteServerProvider) GetRoutes(ctx context.Context) ([]RouteInfo, 
 	}
 
 	var (
-		mu     sync.Mutex
-		wg     sync.WaitGroup
-		routes []RouteInfo
+		mu        sync.Mutex
+		wg        sync.WaitGroup
+		routes    []RouteInfo
+		durations []time.Duration
 	)
 	for _, peer := range peers {
 		wg.Go(func() {
+			start := time.Now()
 			peerRoutes, err := p.learnedRoutes(ctx, peer)
 			if err != nil {
 				log.Warnf("%v", err)
@@ -228,12 +230,24 @@ func (p *AzureRouteServerProvider) GetRoutes(ctx context.Context) ([]RouteInfo, 
 			}
 			mu.Lock()
 			routes = append(routes, peerRoutes...)
+			durations = append(durations, time.Since(start))
 			mu.Unlock()
 		})
 	}
 	wg.Wait()
+	logQueryDurations("Learned routes (T1)", durations)
 
 	return routes, nil
+}
+
+// logQueryDurations logs the shortest and longest query of a parallel round. Azure takes its snapshot
+// somewhere within each query, so this bounds how late a detection can be stamped.
+func logQueryDurations(what string, durations []time.Duration) {
+	if len(durations) == 0 {
+		return
+	}
+	log.Debugf("%s: %d queries took %v to %v", what, len(durations),
+		slices.Min(durations).Round(time.Millisecond), slices.Max(durations).Round(time.Millisecond))
 }
 
 // pollEverySecond drives a long-running operation to completion, checking its status every second.
@@ -284,22 +298,27 @@ func (p *AzureRouteServerProvider) learnedRoutes(ctx context.Context, peer strin
 // FirstSeen is the earliest NIC sighting; AllSeen is the latest first sighting once every NIC has the subnet.
 func (p *AzureRouteServerProvider) CheckRouteTables(ctx context.Context, _ string, subnets []string) (map[string]RouteTableStatus, error) {
 	var (
-		wg       sync.WaitGroup
-		errMu    sync.Mutex
-		firstErr error
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		firstErr  error
+		durations []time.Duration
 	)
 	for _, nic := range p.peerNICs {
 		wg.Go(func() {
+			start := time.Now()
 			prefixes, err := p.effectiveRoutes(ctx, nic)
+			mu.Lock()
 			if err != nil {
-				errMu.Lock()
 				if firstErr == nil {
 					firstErr = err
 				}
-				errMu.Unlock()
+				mu.Unlock()
 				return
 			}
 			at := time.Now().UTC()
+			durations = append(durations, at.Sub(start))
+			mu.Unlock()
+
 			p.mu.Lock()
 			defer p.mu.Unlock()
 			for _, subnet := range subnets {
@@ -316,6 +335,7 @@ func (p *AzureRouteServerProvider) CheckRouteTables(ctx context.Context, _ strin
 		})
 	}
 	wg.Wait()
+	logQueryDurations("Effective routes (T3/T3.5)", durations)
 	// Sightings from NICs that answered are kept, so a failed round loses no timestamps
 	if firstErr != nil {
 		return nil, firstErr
