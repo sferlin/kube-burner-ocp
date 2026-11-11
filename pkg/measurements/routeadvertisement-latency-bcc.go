@@ -62,6 +62,7 @@ const (
 	raLatencyBCCMeasurement          = "raLatencyBCCMeasurement"
 	raLatencyBCCQuantilesMeasurement = "raLatencyBCCQuantilesMeasurement"
 	conditionStatusTrue              = "True"
+	cloudProviderAWS                 = "aws"
 	cloudProviderAzure               = "azure"
 	conditionNetworkCreated          = "NetworkCreated"
 	conditionRACreated               = "RouteAdvertisementsCreated"
@@ -157,8 +158,8 @@ func (plmf raLatencyBCCMeasurementFactory) NewMeasurement(jobConfig *config.Job,
 	}
 }
 
-// handleAdd records BGPRouting creation timestamp and advertised subnets.
-func (r *raLatencyBCC) handleAdd(obj any) {
+// handleBGPRoutingAdd records BGPRouting creation timestamp and advertised subnets.
+func (r *raLatencyBCC) handleBGPRoutingAdd(obj any) {
 	bgpRouting := obj.(*unstructured.Unstructured)
 
 	bgpRoutingName, _, _ := unstructured.NestedString(bgpRouting.UnstructuredContent(), "metadata", "name")
@@ -434,7 +435,7 @@ func (r *raLatencyBCC) startMonitoring() error {
 	var err error
 
 	switch r.cloudProvider {
-	case "aws":
+	case cloudProviderAWS:
 		routeProvider, err = utils.NewBCCRouteServerObserver(r.inputs["awsRegion"], r.inputs["routeServerId"])
 		routeTableResourceID = r.inputs["vpcId"]
 		if err != nil {
@@ -475,7 +476,7 @@ func (r *raLatencyBCC) startMonitoring() error {
 	bgpRoutingFactory := dynamicinformer.NewFilteredDynamicSharedInformerFactory(r.connector.DynamicClient(), time.Minute, metav1.NamespaceAll, nil)
 	bgpRoutingInformer := bgpRoutingFactory.ForResource(bgpRoutingGVR).Informer()
 	bgpRoutingInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    r.handleAdd,
+		AddFunc:    r.handleBGPRoutingAdd,
 		UpdateFunc: r.handleBGPRoutingUpdate,
 	})
 
@@ -605,48 +606,28 @@ func (r *raLatencyBCC) pingWorker() {
 	}
 }
 
+// pingUntilReachable pings the pod right away and then every pingInterval until it answers (T5),
+// maxTimeout passes, or the measurement stops.
 func (r *raLatencyBCC) pingUntilReachable(podIP, subnet string) {
 	defer r.wg.Done()
 	defer atomic.AddUint64(&r.finishedPingCount, 1)
 	log.Debugf("Starting ping of POD %s in subnet %s", podIP, subnet)
 
-	ping := func() bool {
-		if pingPodIP(podIP) {
-			now := time.Now().UTC()
-			log.Infof("T5: Pod %s reachable at %v", podIP, now)
-
-			// Update T5 timestamp in pod measurements (keyed by subnet)
-			val, ok := r.podTimestamps.Load(subnet)
-			if !ok {
-				log.Warnf("Pod measurement not found for subnet %s", subnet)
-				return true
-			}
-
-			podMeas := val.(*podMeasurement)
-			podMeas.t5_PingSuccess = now
-			r.podTimestamps.Store(subnet, podMeas)
-			log.Debugf("T5: Pod %s from subnet %s is pingable", podIP, subnet)
-			return true
-		}
-		return false
-	}
-
-	if ping() {
-		return
-	}
-
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
-
 	timeout := time.NewTimer(r.maxTimeout)
 	defer timeout.Stop()
 
 	for {
+		if pingPodIP(podIP) {
+			now := time.Now().UTC()
+			val, _ := r.podTimestamps.Load(subnet) // stored by recordT4 before the ping started
+			val.(*podMeasurement).t5_PingSuccess = now
+			log.Infof("T5: Pod %s reachable at %v", podIP, now)
+			return
+		}
 		select {
 		case <-ticker.C:
-			if ping() {
-				return
-			}
 		case <-timeout.C:
 			log.Warnf("T5: Timeout reached for pod %s", podIP)
 			return
