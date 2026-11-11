@@ -43,14 +43,15 @@ import (
 )
 
 // raLatencyBCC measures end-to-end latency for BGP Cloud Connector (BCC) route advertisement from OpenShift to cloud route servers.
-// Supports AWS VPC Route Server and Azure Route Server. It tracks up to seven timestamps (T0-T5) for each BGPRouting CR:
+// Supports AWS VPC Route Server and Azure Route Server. It tracks up to nine timestamps (T0-T5) for each BGPRouting CR:
 //
 // T0: BGPRouting condition NetworkCreated becomes True (the BGP Cloud Connector created its CUDN)
 // T0.5: BGPRouting condition RouteAdvertisementsCreated becomes True (the shared RouteAdvertisements exist)
-// T1: Route appears in the Route Server RIB (AWS routing database / Azure BGP learned routes)
+// T1: Route appears in the Route Server RIB (AWS routing database / learned routes of the first Azure BGP peer)
+// T1.5: Route appears in the RIB from every BGP peer (AWS routing database entries / Azure learned routes)
 // T2: Route becomes active for forwarding (AWS Route Server FIB / Azure NIC effective routes)
 // T3: Route appears in the cloud route table (AWS VPC route tables / effective routes of the first Azure BGP peer NIC)
-// T3.5: (Azure only) Route appears in the effective routes of every Azure BGP peer NIC
+// T3.5: Route appears in all route tables (AWS: route server installation status / Azure: every BGP peer NIC)
 // T4: Pod receives its CUDN IP address and enters Running state
 // T5: Pod becomes network-reachable (first successful ICMP ping)
 //
@@ -119,6 +120,12 @@ type raMetricBCC struct {
 	T1_AvgLatency int       `json:"t1_avgLatency,omitempty"`
 	T1_P99Latency int       `json:"t1_p99Latency,omitempty"`
 
+	T1_5_AllPeersLatency []float64 `json:"t1_5_allPeersLatency,omitempty"`
+	T1_5_MinLatency      int       `json:"t1_5_minLatency,omitempty"`
+	T1_5_MaxLatency      int       `json:"t1_5_maxLatency,omitempty"`
+	T1_5_AvgLatency      int       `json:"t1_5_avgLatency,omitempty"`
+	T1_5_P99Latency      int       `json:"t1_5_p99Latency,omitempty"`
+
 	T2_FibLatency []float64 `json:"t2_fibLatency,omitempty"`
 	T2_MinLatency int       `json:"t2_minLatency,omitempty"`
 	T2_MaxLatency int       `json:"t2_maxLatency,omitempty"`
@@ -157,6 +164,7 @@ type detectedRoute struct {
 	t0_NetworkCreated time.Time
 	t0_5_RACreated    time.Time
 	t1_RibTimestamp   time.Time
+	t1_5_AllPeers     time.Time
 	t2_FibTimestamp   time.Time
 	t3_VpcTimestamp   time.Time
 	t3_5_AllPeers     time.Time
@@ -245,6 +253,7 @@ func (r *raLatencyBCC) handleAdd(obj any) {
 		T0_NetworkCreatedLatency: []float64{},
 		T0_5_RACreatedLatency:    []float64{},
 		T1_RibLatency:            []float64{},
+		T1_5_AllPeersLatency:     []float64{},
 		T2_FibLatency:            []float64{},
 		T3_VpcRouteTableLatency:  []float64{},
 		T3_5_AllPeersLatency:     []float64{},
@@ -292,9 +301,10 @@ func (r *raLatencyBCC) handleBGPRoutingUpdate(_, newObj any) {
 }
 
 type newRoute struct {
-	Dst   string
-	Ts    time.Time
-	InFIB bool
+	Dst     string
+	Ts      time.Time
+	InFIB   bool
+	AllSeen time.Time // when every BGP peer had the route (T1.5)
 }
 
 func (r *raLatencyBCC) observerWorker(routeProvider utils.BCCRouteServerProvider, routeCh chan<- newRoute, baselineReadCh chan<- struct{}, routeTableCheckCh chan<- struct{}) {
@@ -303,6 +313,7 @@ func (r *raLatencyBCC) observerWorker(routeProvider utils.BCCRouteServerProvider
 	baselineRead := false
 	currentSubnets := make(map[string]bool)
 	currentFibState := make(map[string]bool)
+	allPeersReported := make(map[string]bool) // T1.5 already sent, or route present at baseline
 
 	read := func() {
 		routes, err := routeProvider.GetRoutes(context.Background())
@@ -318,6 +329,11 @@ func (r *raLatencyBCC) observerWorker(routeProvider utils.BCCRouteServerProvider
 		for _, route := range routes {
 			subnetString := route.Prefix
 			inFIB := route.InFIB
+			// Providers that stamp each peer (Azure) report when the route was first seen; otherwise use the poll time
+			ts := now
+			if !route.FirstSeen.IsZero() {
+				ts = route.FirstSeen
+			}
 
 			fetchedSubnets[subnetString] = true
 			fetchedFibState[subnetString] = inFIB
@@ -331,9 +347,10 @@ func (r *raLatencyBCC) observerWorker(routeProvider utils.BCCRouteServerProvider
 				currentFibState[subnetString] = inFIB
 				if baselineRead {
 					log.Debugf("New route detected: %s (inFIB: %v)", subnetString, inFIB)
-					routeCh <- newRoute{Dst: subnetString, Ts: now, InFIB: inFIB}
+					routeCh <- newRoute{Dst: subnetString, Ts: ts, InFIB: inFIB}
 				} else {
 					log.Debugf("Baseline route detected: %s", subnetString)
+					allPeersReported[subnetString] = true
 				}
 			} else if baselineRead && !wasFibActive && inFIB {
 				// FIB state changed from false to true (T2)
@@ -346,6 +363,11 @@ func (r *raLatencyBCC) observerWorker(routeProvider utils.BCCRouteServerProvider
 				case routeTableCheckCh <- struct{}{}:
 				default:
 				}
+			}
+
+			if !route.AllSeen.IsZero() && !allPeersReported[subnetString] {
+				allPeersReported[subnetString] = true
+				routeCh <- newRoute{Dst: subnetString, Ts: ts, InFIB: inFIB, AllSeen: route.AllSeen}
 			}
 		}
 
@@ -380,7 +402,7 @@ func (r *raLatencyBCC) observerWorker(routeProvider utils.BCCRouteServerProvider
 }
 
 // routeServerPending reports whether any BGPRouting subnet still needs a Route Server observation:
-// T1 on Azure, T2 on AWS (which follows T1). Polling stops otherwise, to avoid cloud API throttling.
+// T1 and T1.5, plus T2 on AWS. Polling stops otherwise, to avoid cloud API throttling.
 func (r *raLatencyBCC) routeServerPending() bool {
 	r.routeMu.Lock()
 	defer r.routeMu.Unlock()
@@ -393,7 +415,8 @@ func (r *raLatencyBCC) routeServerPending() bool {
 				return false
 			}
 			route := val.(*detectedRoute)
-			if route.t1_RibTimestamp.IsZero() || (cloudProvider != cloudProviderAzure && route.t2_FibTimestamp.IsZero()) {
+			awaitingFIB := cloudProvider != cloudProviderAzure && route.t2_FibTimestamp.IsZero()
+			if route.t1_RibTimestamp.IsZero() || route.t1_5_AllPeers.IsZero() || awaitingFIB {
 				pending = true
 				return false
 			}
@@ -424,8 +447,14 @@ func (r *raLatencyBCC) worker(routeCh <-chan newRoute) {
 			if route.t1_RibTimestamp.IsZero() {
 				route.t1_RibTimestamp = now
 				log.Debugf("T1: Route %s in RIB at %v", subnet, now)
-				// On Azure, T1 and T3.5 come from independent queries; whichever arrives second completes the route
-				if cloudProvider == cloudProviderAzure && !route.t3_5_AllPeers.IsZero() {
+			}
+
+			// T1.5: route learned from every BGP peer. A route completes once it has both T1.5 and T3.5,
+			// which come from independent queries; whichever arrives second completes it.
+			if !update.AllSeen.IsZero() && route.t1_5_AllPeers.IsZero() {
+				route.t1_5_AllPeers = update.AllSeen
+				log.Debugf("T1.5: Route %s in RIB from all BGP peers at %v", subnet, update.AllSeen)
+				if !route.t3_5_AllPeers.IsZero() {
 					atomic.AddUint64(&r.detectedRouteCount, 1)
 				}
 			}
@@ -451,19 +480,15 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerPro
 	defer ticker.Stop()
 
 	checkRouteTable := func() {
-		// Collect subnets still waiting for route table detection. AWS only checks routes already in FIB (T2)
-		// until T3; Azure exposes no FIB state, so every tracked route is checked until T3.5.
+		// Collect subnets still waiting for T3.5. AWS only checks routes already in FIB (T2);
+		// Azure exposes no FIB state, so every tracked route is checked.
 		var pendingSubnets []string
 		r.routeMu.Lock()
 		r.routeTimestamps.Range(func(key, value any) bool {
 			subnet := key.(string)
 			route := value.(*detectedRoute)
 
-			pending := route.t3_VpcTimestamp.IsZero() && !route.t2_FibTimestamp.IsZero()
-			if cloudProvider == cloudProviderAzure {
-				pending = route.t3_5_AllPeers.IsZero()
-			}
-			if pending {
+			if route.t3_5_AllPeers.IsZero() && (cloudProvider == cloudProviderAzure || !route.t2_FibTimestamp.IsZero()) {
 				pendingSubnets = append(pendingSubnets, subnet)
 			}
 			return true
@@ -482,7 +507,7 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerPro
 		}
 
 		// Update timestamps for routes found in route table, using the time the provider first saw them.
-		// A route counts as detected at T3 on AWS (T1 and T2 precede it); on Azure once it has both T3.5 and T1.
+		// A route counts as detected once it has both T3.5 and T1.5.
 		r.routeMu.Lock()
 		defer r.routeMu.Unlock()
 		for subnet, status := range found {
@@ -500,14 +525,16 @@ func (r *raLatencyBCC) vpcRouteTableWorker(routeProvider utils.BCCRouteServerPro
 				}
 				route.t3_VpcTimestamp = status.FirstSeen
 				log.Debugf("T3: Route %s found in route table at %v", subnet, status.FirstSeen)
-				if cloudProvider != cloudProviderAzure {
-					atomic.AddUint64(&r.detectedRouteCount, 1)
-				}
 			}
 			if !status.AllSeen.IsZero() && route.t3_5_AllPeers.IsZero() {
+				// On AWS, T3.5 comes from the route server's installation status and T3 from the route tables;
+				// never report the route in all route tables before it was seen in the first one
 				route.t3_5_AllPeers = status.AllSeen
-				log.Debugf("T3.5: Route %s found on all BGP peer NICs at %v", subnet, status.AllSeen)
-				if !route.t1_RibTimestamp.IsZero() {
+				if route.t3_5_AllPeers.Before(route.t3_VpcTimestamp) {
+					route.t3_5_AllPeers = route.t3_VpcTimestamp
+				}
+				log.Debugf("T3.5: Route %s found in all route tables at %v", subnet, route.t3_5_AllPeers)
+				if !route.t1_5_AllPeers.IsZero() {
 					atomic.AddUint64(&r.detectedRouteCount, 1)
 				}
 			}
@@ -1004,6 +1031,15 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 				log.Warnf("BGPRouting %s advertised subnet %s but it was never detected in RIB", m.Name, subnet)
 			}
 
+			// Calculate T1.5 latency (RIB from all BGP peers)
+			if !routeVal.t1_5_AllPeers.IsZero() {
+				latencyMs := float64(routeVal.t1_5_AllPeers.Sub(m.Timestamp).Milliseconds())
+				m.T1_5_AllPeersLatency = append(m.T1_5_AllPeersLatency, latencyMs)
+				log.Debugf("T1.5: BGPRouting %s subnet %s RIB from all peers latency: %.0f ms", m.Name, subnet, latencyMs)
+			} else {
+				log.Warnf("BGPRouting %s advertised subnet %s but it was never learned from all BGP peers", m.Name, subnet)
+			}
+
 			// Calculate T2 latency (FIB)
 			if !routeVal.t2_FibTimestamp.IsZero() {
 				latencyMs := float64(routeVal.t2_FibTimestamp.Sub(m.Timestamp).Milliseconds())
@@ -1022,13 +1058,13 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 				log.Warnf("BGPRouting %s advertised subnet %s but it was never detected in route table", m.Name, subnet)
 			}
 
-			// Calculate T3.5 latency (route table on all BGP peer NICs, Azure only)
+			// Calculate T3.5 latency (all route tables)
 			if !routeVal.t3_5_AllPeers.IsZero() {
 				latencyMs := float64(routeVal.t3_5_AllPeers.Sub(m.Timestamp).Milliseconds())
 				m.T3_5_AllPeersLatency = append(m.T3_5_AllPeersLatency, latencyMs)
 				log.Debugf("T3.5: BGPRouting %s subnet %s all peers latency: %.0f ms", m.Name, subnet, latencyMs)
-			} else if cloudProvider == cloudProviderAzure {
-				log.Warnf("BGPRouting %s advertised subnet %s but it never reached all BGP peer NICs", m.Name, subnet)
+			} else {
+				log.Warnf("BGPRouting %s advertised subnet %s but it never reached all route tables", m.Name, subnet)
 			}
 
 			// Calculate T4 and T5 latencies from pod measurements
@@ -1087,6 +1123,17 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 				m.Name, t1Summary.Min, t1Summary.Max, t1Summary.Avg, t1Summary.P99)
 		}
 
+		// Calculate T1.5 statistics
+		if len(m.T1_5_AllPeersLatency) > 0 {
+			t15Summary := metrics.NewLatencySummary(m.T1_5_AllPeersLatency, m.Name+"-T1.5")
+			m.T1_5_MinLatency = t15Summary.Min
+			m.T1_5_MaxLatency = t15Summary.Max
+			m.T1_5_AvgLatency = t15Summary.Avg
+			m.T1_5_P99Latency = t15Summary.P99
+			log.Debugf("T1.5 (RIB All Peers) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
+				m.Name, t15Summary.Min, t15Summary.Max, t15Summary.Avg, t15Summary.P99)
+		}
+
 		// Calculate T2 statistics
 		if len(m.T2_FibLatency) > 0 {
 			t2Summary := metrics.NewLatencySummary(m.T2_FibLatency, m.Name+"-T2")
@@ -1116,7 +1163,7 @@ func (r *raLatencyBCC) normalizeMetrics() float64 {
 			m.T3_5_MaxLatency = t35Summary.Max
 			m.T3_5_AvgLatency = t35Summary.Avg
 			m.T3_5_P99Latency = t35Summary.P99
-			log.Debugf("T3.5 (All Peers) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
+			log.Debugf("T3.5 (All Route Tables) %s - Min: %dms, Max: %dms, Avg: %dms, P99: %dms",
 				m.Name, t35Summary.Min, t35Summary.Max, t35Summary.Avg, t35Summary.P99)
 		}
 
@@ -1165,6 +1212,7 @@ func (r *raLatencyBCC) getLatency(normLatency any) map[string]float64 {
 	add("T0", m.T0_NetworkCreatedLatency, m.T0_AvgLatency)
 	add("T0_5", m.T0_5_RACreatedLatency, m.T0_5_AvgLatency)
 	add("T1", m.T1_RibLatency, m.T1_AvgLatency)
+	add("T1_5", m.T1_5_AllPeersLatency, m.T1_5_AvgLatency)
 	add("T2", m.T2_FibLatency, m.T2_AvgLatency)
 	add("T3", m.T3_VpcRouteTableLatency, m.T3_AvgLatency)
 	add("T3_5", m.T3_5_AllPeersLatency, m.T3_5_AvgLatency)

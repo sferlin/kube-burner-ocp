@@ -27,7 +27,7 @@ type RouteInfo struct {
 	Prefix string // CIDR block (e.g., "10.0.0.0/16")
 	InFIB  bool   // Whether the route is active in the Forwarding Information Base
 
-	// Only set by providers that query the RIB per BGP peer (Azure); zero otherwise.
+	// Per-BGP-peer sightings; zero when the provider does not report them.
 	FirstSeen time.Time // first peer that reported the route
 	AllSeen   time.Time // when the last peer first reported it, once every peer has
 }
@@ -44,11 +44,40 @@ type BCCRouteServerProvider interface {
 	CheckRouteTables(ctx context.Context, resourceID string, subnets []string) (map[string]RouteTableStatus, error)
 }
 
-// RouteTableStatus reports when a subnet was first found; zero times mean not found yet. AllSeen is only
-// set by providers that check several locations which must each receive the route (Azure BGP peer NICs).
+// RouteTableStatus reports when a subnet was first found; zero times mean not found yet. AllSeen is set
+// once every location that must receive the route has it (Azure: BGP peer NICs; AWS: route tables the
+// route server installs into).
 type RouteTableStatus struct {
 	FirstSeen time.Time // first found in any route table
 	AllSeen   time.Time // found in every route table checked (when the last one first had it)
+}
+
+// sightings records, per prefix, when each peer (BGP connection or NIC) first reported it.
+type sightings map[string]map[string]time.Time
+
+func (s sightings) record(prefix, peer string, at time.Time) {
+	if s[prefix] == nil {
+		s[prefix] = map[string]time.Time{}
+	}
+	if _, seen := s[prefix][peer]; !seen {
+		s[prefix][peer] = at
+	}
+}
+
+// span returns the earliest sighting of prefix and, once all total peers have reported it, the latest first sighting.
+func (s sightings) span(prefix string, total int) (first, all time.Time) {
+	for _, at := range s[prefix] {
+		if first.IsZero() || at.Before(first) {
+			first = at
+		}
+		if at.After(all) {
+			all = at
+		}
+	}
+	if total <= 0 || len(s[prefix]) < total {
+		all = time.Time{}
+	}
+	return first, all
 }
 
 // ValidateConnectivity tests a Route Server provider's connectivity.

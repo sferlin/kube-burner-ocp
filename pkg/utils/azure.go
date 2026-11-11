@@ -40,8 +40,9 @@ type AzureRouteServerProvider struct {
 	peerConnections []string // BGP connection names, discovered once at startup
 	peerNICs        []*arm.ResourceID
 
-	mu     sync.Mutex
-	seenAt map[string]map[string]time.Time // subnet -> peer NIC name -> when its query first returned the subnet
+	mu      sync.Mutex
+	ribSeen sightings // prefix -> BGP connection -> when its learned routes first contained the prefix
+	nicSeen sightings // subnet -> peer NIC -> when its effective routes first contained the subnet
 }
 
 // NewAzureRouteServerProvider creates a new Azure Route Server provider and discovers the NICs of its BGP peers.
@@ -75,7 +76,8 @@ func NewAzureRouteServerProvider(subscriptionID, routeServerRG, routeServerName 
 		nicClient:       nicClient,
 		routeServerName: routeServerName,
 		routeServerRG:   routeServerRG,
-		seenAt:          map[string]map[string]time.Time{},
+		ribSeen:         sightings{},
+		nicSeen:         sightings{},
 	}
 	ctx := context.Background()
 	peers, err := p.bgpPeers(ctx)
@@ -204,32 +206,49 @@ func vnetOf(subnetID string) string {
 	return id
 }
 
-// GetRoutes returns the routes learned by the Route Server from all of its BGP peers (T1).
-// Each peer's learned routes are a separate long-running operation, so all peers are queried in parallel.
+// GetRoutes returns the routes the Route Server currently learns from its BGP peers (T1/T1.5). All peers
+// are queried in parallel and each is stamped when its own query returns a prefix: FirstSeen is the earliest
+// peer sighting, AllSeen the latest first sighting once every peer has learned the prefix.
 func (p *AzureRouteServerProvider) GetRoutes(ctx context.Context) ([]RouteInfo, error) {
 	var (
 		mu        sync.Mutex
 		wg        sync.WaitGroup
-		routes    []RouteInfo
+		current   = map[string]bool{}
 		durations []time.Duration
 	)
 	for _, peer := range p.peerConnections {
 		wg.Go(func() {
 			start := time.Now()
-			peerRoutes, err := p.learnedRoutes(ctx, peer)
+			prefixes, err := p.learnedRoutes(ctx, peer)
 			if err != nil {
 				log.Warnf("%v", err)
 				return
 			}
+			at := time.Now().UTC()
 			mu.Lock()
-			routes = append(routes, peerRoutes...)
-			durations = append(durations, time.Since(start))
+			for prefix := range prefixes {
+				current[prefix] = true
+			}
+			durations = append(durations, at.Sub(start))
 			mu.Unlock()
+
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			for prefix := range prefixes {
+				p.ribSeen.record(prefix, peer, at)
+			}
 		})
 	}
 	wg.Wait()
-	logQueryDurations("Learned routes (T1)", durations)
+	logQueryDurations("Learned routes (T1/T1.5)", durations)
 
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	routes := make([]RouteInfo, 0, len(current))
+	for prefix := range current {
+		first, all := p.ribSeen.span(prefix, len(p.peerConnections))
+		routes = append(routes, RouteInfo{Prefix: prefix, FirstSeen: first, AllSeen: all})
+	}
 	return routes, nil
 }
 
@@ -263,8 +282,8 @@ func pollEverySecond[T any](ctx context.Context, poller *azruntime.Poller[T]) (T
 	return poller.Result(ctx)
 }
 
-// learnedRoutes returns the routes the Route Server learned from one BGP peer.
-func (p *AzureRouteServerProvider) learnedRoutes(ctx context.Context, peer string) ([]RouteInfo, error) {
+// learnedRoutes returns the prefixes the Route Server learned from one BGP peer.
+func (p *AzureRouteServerProvider) learnedRoutes(ctx context.Context, peer string) (map[string]bool, error) {
 	poller, err := p.bgpClient.BeginListLearnedRoutes(ctx, p.routeServerRG, p.routeServerName, peer, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query learned routes from peer %s: %w", peer, err)
@@ -274,16 +293,16 @@ func (p *AzureRouteServerProvider) learnedRoutes(ctx context.Context, peer strin
 		return nil, fmt.Errorf("failed to poll learned routes from peer %s: %w", peer, err)
 	}
 
-	var routes []RouteInfo
+	prefixes := map[string]bool{}
 	// Value maps each virtual router instance to the routes it learned
 	for _, instanceRoutes := range res.Value {
 		for _, route := range instanceRoutes {
 			if route != nil && route.Network != nil {
-				routes = append(routes, RouteInfo{Prefix: *route.Network})
+				prefixes[*route.Network] = true
 			}
 		}
 	}
-	return routes, nil
+	return prefixes, nil
 }
 
 // CheckRouteTables queries the effective routes of all BGP peer NICs in parallel. Each NIC is stamped
@@ -315,14 +334,8 @@ func (p *AzureRouteServerProvider) CheckRouteTables(ctx context.Context, _ strin
 			p.mu.Lock()
 			defer p.mu.Unlock()
 			for _, subnet := range subnets {
-				if !prefixes[subnet] {
-					continue
-				}
-				if p.seenAt[subnet] == nil {
-					p.seenAt[subnet] = map[string]time.Time{}
-				}
-				if _, seen := p.seenAt[subnet][nic.Name]; !seen {
-					p.seenAt[subnet][nic.Name] = at
+				if prefixes[subnet] {
+					p.nicSeen.record(subnet, nic.Name, at)
 				}
 			}
 		})
@@ -338,19 +351,8 @@ func (p *AzureRouteServerProvider) CheckRouteTables(ctx context.Context, _ strin
 	defer p.mu.Unlock()
 	found := make(map[string]RouteTableStatus, len(subnets))
 	for _, subnet := range subnets {
-		var status RouteTableStatus
-		for _, at := range p.seenAt[subnet] {
-			if status.FirstSeen.IsZero() || at.Before(status.FirstSeen) {
-				status.FirstSeen = at
-			}
-			if at.After(status.AllSeen) {
-				status.AllSeen = at
-			}
-		}
-		if len(p.seenAt[subnet]) < len(p.peerNICs) {
-			status.AllSeen = time.Time{}
-		}
-		found[subnet] = status
+		first, all := p.nicSeen.span(subnet, len(p.peerNICs))
+		found[subnet] = RouteTableStatus{FirstSeen: first, AllSeen: all}
 	}
 	return found, nil
 }

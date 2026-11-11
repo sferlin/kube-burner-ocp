@@ -17,6 +17,7 @@ package utils
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -30,6 +31,12 @@ import (
 type BCCRouteServerObserver struct {
 	client        *ec2.Client
 	routeServerID string
+	peerCount     int // available route server peers, counted once at startup
+
+	mu            sync.Mutex
+	ribSeen       sightings                  // prefix -> peer -> first poll with a routing database entry from that peer
+	installSeen   sightings                  // prefix -> route table -> first poll reporting the route installed there
+	installTables map[string]map[string]bool // prefix -> route tables the route server installs it into
 }
 
 // NewBCCRouteServerObserver creates a new AWS Route Server observer that implements BCCRouteServerProvider.
@@ -47,13 +54,47 @@ func NewBCCRouteServerObserver(region, routeServerID string) (*BCCRouteServerObs
 		return nil, fmt.Errorf("unable to load AWS config: %w", err)
 	}
 
-	return &BCCRouteServerObserver{
+	o := &BCCRouteServerObserver{
 		client:        ec2.NewFromConfig(cfg),
 		routeServerID: routeServerID,
-	}, nil
+		ribSeen:       sightings{},
+		installSeen:   sightings{},
+		installTables: map[string]map[string]bool{},
+	}
+	if o.peerCount, err = o.countPeers(context.Background()); err != nil {
+		return nil, err
+	}
+	return o, nil
 }
 
-// GetRoutes retrieves all routes from the AWS Route Server routing database and returns them as cloud-agnostic RouteInfo objects.
+// countPeers returns the number of available peers of the route server.
+func (o *BCCRouteServerObserver) countPeers(ctx context.Context) (int, error) {
+	count := 0
+	var nextToken *string
+	for {
+		output, err := o.client.DescribeRouteServerPeers(ctx, &ec2.DescribeRouteServerPeersInput{NextToken: nextToken})
+		if err != nil {
+			return 0, fmt.Errorf("describe route server peers: %w", err)
+		}
+		for _, peer := range output.RouteServerPeers {
+			if aws.ToString(peer.RouteServerId) == o.routeServerID && peer.State == ec2types.RouteServerPeerStateAvailable {
+				count++
+			}
+		}
+		if aws.ToString(output.NextToken) == "" {
+			break
+		}
+		nextToken = output.NextToken
+	}
+	if count == 0 {
+		return 0, fmt.Errorf("route server %s has no available peers", o.routeServerID)
+	}
+	return count, nil
+}
+
+// GetRoutes retrieves the AWS Route Server routing database, which has one entry per prefix and peer, and returns
+// one RouteInfo per prefix. FirstSeen/AllSeen record the first poll with an entry from any/every peer (T1/T1.5).
+// The entries' route table installation status is kept for CheckRouteTables (T3.5).
 func (o *BCCRouteServerObserver) GetRoutes(ctx context.Context) ([]RouteInfo, error) {
 	var awsRoutes []ec2types.RouteServerRoute
 	var nextToken *string
@@ -82,15 +123,32 @@ func (o *BCCRouteServerObserver) GetRoutes(ctx context.Context) ([]RouteInfo, er
 		nextToken = output.NextToken
 	}
 
-	// Convert AWS-specific types to cloud-agnostic RouteInfo
-	routes := make([]RouteInfo, len(awsRoutes))
-	for i, route := range awsRoutes {
-		routes[i] = RouteInfo{
-			Prefix: aws.ToString(route.Prefix),
-			InFIB:  route.RouteStatus == ec2types.RouteServerRouteStatusInFib,
+	now := time.Now().UTC()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	inFIB := map[string]bool{}
+	for _, route := range awsRoutes {
+		prefix := aws.ToString(route.Prefix)
+		inFIB[prefix] = inFIB[prefix] || route.RouteStatus == ec2types.RouteServerRouteStatusInFib
+		o.ribSeen.record(prefix, aws.ToString(route.RouteServerPeerId), now)
+		for _, detail := range route.RouteInstallationDetails {
+			table := aws.ToString(detail.RouteTableId)
+			if o.installTables[prefix] == nil {
+				o.installTables[prefix] = map[string]bool{}
+			}
+			o.installTables[prefix][table] = true
+			if detail.RouteInstallationStatus == ec2types.RouteServerRouteInstallationStatusInstalled {
+				o.installSeen.record(prefix, table, now)
+			}
 		}
 	}
 
+	routes := make([]RouteInfo, 0, len(inFIB))
+	for prefix, fib := range inFIB {
+		first, all := o.ribSeen.span(prefix, o.peerCount)
+		routes = append(routes, RouteInfo{Prefix: prefix, InFIB: fib, FirstSeen: first, AllSeen: all})
+	}
 	return routes, nil
 }
 
@@ -131,6 +189,15 @@ func (o *BCCRouteServerObserver) CheckRouteTables(ctx context.Context, resourceI
 				found[destCidr] = RouteTableStatus{FirstSeen: now}
 			}
 		}
+	}
+
+	// T3.5: every route table the route server installs the route into reports it installed,
+	// as recorded from the routing database by GetRoutes
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for subnet, status := range found {
+		_, status.AllSeen = o.installSeen.span(subnet, len(o.installTables[subnet]))
+		found[subnet] = status
 	}
 
 	return found, nil
