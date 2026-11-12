@@ -25,7 +25,7 @@ import (
 // RouteInfo represents a cloud-agnostic route in a Route Server's routing database.
 type RouteInfo struct {
 	Prefix string // CIDR block (e.g., "10.0.0.0/16")
-	InFIB  bool   // Whether the route is active in the Forwarding Information Base
+	InFIB  bool   // Whether the route is active in the FIB (AWS only; Azure exposes no FIB state)
 
 	// Per-BGP-peer sightings; zero when the provider does not report them.
 	FirstSeen time.Time // first peer that reported the route
@@ -39,9 +39,8 @@ type BCCRouteServerProvider interface {
 	GetRoutes(ctx context.Context) ([]RouteInfo, error)
 
 	// CheckRouteTables checks which subnets are present in cloud-specific routing resources.
-	// For AWS: checks the route tables of the VPC given by resourceID.
-	// For Azure: checks the effective routes of every BGP peer NIC; resourceID is unused.
-	CheckRouteTables(ctx context.Context, resourceID string, subnets []string) (map[string]RouteTableStatus, error)
+	// For AWS: the route tables of the provider's VPC. For Azure: the effective routes of every BGP peer NIC.
+	CheckRouteTables(ctx context.Context, subnets []string) (map[string]RouteTableStatus, error)
 }
 
 // RouteTableStatus reports when a subnet was first found; zero times mean not found yet. AllSeen is set
@@ -82,7 +81,7 @@ func (s sightings) span(prefix string, total int) (first, all time.Time) {
 
 // ValidateConnectivity tests a Route Server provider's connectivity.
 // cloud is the provider name (aws, azure) for logging purposes.
-func ValidateConnectivity(cloud string, provider BCCRouteServerProvider, resourceID string) error {
+func ValidateConnectivity(cloud string, provider BCCRouteServerProvider) error {
 	log.Infof("Validating %s Route Server connectivity", cloud)
 
 	ctx := context.Background()
@@ -97,7 +96,7 @@ func ValidateConnectivity(cloud string, provider BCCRouteServerProvider, resourc
 
 	// Test route table connectivity
 	log.Infof("Testing route table API...")
-	_, err = provider.CheckRouteTables(ctx, resourceID, []string{})
+	_, err = provider.CheckRouteTables(ctx, []string{})
 	if err != nil {
 		return fmt.Errorf("failed to query route tables: %w", err)
 	}

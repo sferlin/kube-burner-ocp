@@ -308,7 +308,7 @@ func (p *AzureRouteServerProvider) learnedRoutes(ctx context.Context, peer strin
 // CheckRouteTables queries the effective routes of all BGP peer NICs in parallel. Each NIC is stamped
 // when its own query returns the subnet, so the result does not depend on the slowest NIC in a round.
 // FirstSeen is the earliest NIC sighting; AllSeen is the latest first sighting once every NIC has the subnet.
-func (p *AzureRouteServerProvider) CheckRouteTables(ctx context.Context, _ string, subnets []string) (map[string]RouteTableStatus, error) {
+func (p *AzureRouteServerProvider) CheckRouteTables(ctx context.Context, subnets []string) (map[string]RouteTableStatus, error) {
 	var (
 		wg        sync.WaitGroup
 		mu        sync.Mutex
@@ -389,5 +389,5 @@ func ValidateAzureConnectivity(subscriptionID, resourceGroup, routeServerName st
 		return fmt.Errorf("invalid Azure configuration (check credentials, subscription, resource group, and route server name): %w", err)
 	}
 
-	return ValidateConnectivity("Azure", provider, "")
+	return ValidateConnectivity("Azure", provider)
 }

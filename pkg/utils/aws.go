@@ -26,12 +26,13 @@ import (
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 )
 
-// BCCRouteServerObserver provides methods to interact with AWS VPC Route Server.
+// AWSRouteServerProvider provides methods to interact with AWS VPC Route Server.
 // It implements the BCCRouteServerProvider interface.
-type BCCRouteServerObserver struct {
+type AWSRouteServerProvider struct {
 	client        *ec2.Client
 	routeServerID string
-	peerCount     int // available route server peers, counted once at startup
+	vpcID         string // VPC whose route tables are checked for T3
+	peerCount     int    // available route server peers, counted once at startup
 
 	mu            sync.Mutex
 	ribSeen       sightings                  // prefix -> peer -> first poll with a routing database entry from that peer
@@ -39,13 +40,16 @@ type BCCRouteServerObserver struct {
 	installTables map[string]map[string]bool // prefix -> route tables the route server installs it into
 }
 
-// NewBCCRouteServerObserver creates a new AWS Route Server observer that implements BCCRouteServerProvider.
-func NewBCCRouteServerObserver(region, routeServerID string) (*BCCRouteServerObserver, error) {
+// NewAWSRouteServerProvider creates a new AWS Route Server provider that implements BCCRouteServerProvider.
+func NewAWSRouteServerProvider(region, routeServerID, vpcID string) (*AWSRouteServerProvider, error) {
 	if region == "" {
 		return nil, fmt.Errorf("AWS region is empty")
 	}
 	if routeServerID == "" {
 		return nil, fmt.Errorf("AWS Route Server ID is empty")
+	}
+	if vpcID == "" {
+		return nil, fmt.Errorf("AWS VPC ID is empty")
 	}
 
 	// Loads credentials, region, profile, IAM role, etc.
@@ -54,9 +58,10 @@ func NewBCCRouteServerObserver(region, routeServerID string) (*BCCRouteServerObs
 		return nil, fmt.Errorf("unable to load AWS config: %w", err)
 	}
 
-	o := &BCCRouteServerObserver{
+	o := &AWSRouteServerProvider{
 		client:        ec2.NewFromConfig(cfg),
 		routeServerID: routeServerID,
+		vpcID:         vpcID,
 		ribSeen:       sightings{},
 		installSeen:   sightings{},
 		installTables: map[string]map[string]bool{},
@@ -68,7 +73,7 @@ func NewBCCRouteServerObserver(region, routeServerID string) (*BCCRouteServerObs
 }
 
 // countPeers returns the number of available peers of the route server.
-func (o *BCCRouteServerObserver) countPeers(ctx context.Context) (int, error) {
+func (o *AWSRouteServerProvider) countPeers(ctx context.Context) (int, error) {
 	count := 0
 	var nextToken *string
 	for {
@@ -95,7 +100,7 @@ func (o *BCCRouteServerObserver) countPeers(ctx context.Context) (int, error) {
 // GetRoutes retrieves the AWS Route Server routing database, which has one entry per prefix and peer, and returns
 // one RouteInfo per prefix. FirstSeen/AllSeen record the first poll with an entry from any/every peer (T1/T1.5).
 // The entries' route table installation status is kept for CheckRouteTables (T3.5).
-func (o *BCCRouteServerObserver) GetRoutes(ctx context.Context) ([]RouteInfo, error) {
+func (o *AWSRouteServerProvider) GetRoutes(ctx context.Context) ([]RouteInfo, error) {
 	var awsRoutes []ec2types.RouteServerRoute
 	var nextToken *string
 
@@ -152,17 +157,13 @@ func (o *BCCRouteServerObserver) GetRoutes(ctx context.Context) ([]RouteInfo, er
 	return routes, nil
 }
 
-// CheckRouteTables checks which subnets are present in VPC route tables.
-func (o *BCCRouteServerObserver) CheckRouteTables(ctx context.Context, vpcID string, subnets []string) (map[string]RouteTableStatus, error) {
-	if vpcID == "" {
-		return nil, fmt.Errorf("VPC ID not configured")
-	}
-
+// CheckRouteTables checks which subnets are present in the VPC's route tables.
+func (o *AWSRouteServerProvider) CheckRouteTables(ctx context.Context, subnets []string) (map[string]RouteTableStatus, error) {
 	input := &ec2.DescribeRouteTablesInput{
 		Filters: []ec2types.Filter{
 			{
 				Name:   aws.String("vpc-id"),
-				Values: []string{vpcID},
+				Values: []string{o.vpcID},
 			},
 		},
 	}
@@ -203,10 +204,10 @@ func (o *BCCRouteServerObserver) CheckRouteTables(ctx context.Context, vpcID str
 
 // ValidateAWSConnectivity validates AWS credentials and connectivity to Route Server and VPC route tables.
 func ValidateAWSConnectivity(region, routeServerID, vpcID string) error {
-	observer, err := NewBCCRouteServerObserver(region, routeServerID)
+	provider, err := NewAWSRouteServerProvider(region, routeServerID, vpcID)
 	if err != nil {
-		return fmt.Errorf("invalid AWS credentials or region (check credentials, region, and route-server-id): %w", err)
+		return fmt.Errorf("invalid AWS configuration (check credentials, aws-region, aws-route-server-id, and aws-vpc-id): %w", err)
 	}
 
-	return ValidateConnectivity("AWS", observer, vpcID)
+	return ValidateConnectivity("AWS", provider)
 }

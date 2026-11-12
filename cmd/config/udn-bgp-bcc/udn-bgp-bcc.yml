@@ -54,8 +54,8 @@ jobs:
           cloudProvider: {{.CLOUD_PROVIDER}}
 {{ if eq .CLOUD_PROVIDER "aws" }}
           awsRegion: {{.AWS_REGION}}
-          routeServerId: {{.ROUTE_SERVER_ID}}
-          vpcId: {{.VPC_ID}}
+          awsRouteServerId: {{.AWS_ROUTE_SERVER_ID}}
+          awsVpcId: {{.AWS_VPC_ID}}
 {{ else if eq .CLOUD_PROVIDER "azure" }}
           azureSubscriptionId: {{.AZURE_SUBSCRIPTION_ID}}
           azureResourceGroup: {{.AZURE_RESOURCE_GROUP}}

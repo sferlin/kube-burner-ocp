@@ -344,7 +344,7 @@ func (r *raLatencyBCC) routeServerPending() bool {
 }
 
 // routeTableWorker detects T3 (route appears in route table) by polling periodically and on demand.
-func (r *raLatencyBCC) routeTableWorker(routeProvider utils.BCCRouteServerProvider, routeTableCheckCh <-chan struct{}, routeTableResourceID string) {
+func (r *raLatencyBCC) routeTableWorker(routeProvider utils.BCCRouteServerProvider, routeTableCheckCh <-chan struct{}) {
 	defer r.wg.Done()
 
 	ticker := time.NewTicker(routePollInterval)
@@ -371,7 +371,7 @@ func (r *raLatencyBCC) routeTableWorker(routeProvider utils.BCCRouteServerProvid
 		}
 
 		// One provider call covers all pending subnets
-		found, err := routeProvider.CheckRouteTables(context.Background(), routeTableResourceID, pendingSubnets)
+		found, err := routeProvider.CheckRouteTables(context.Background(), pendingSubnets)
 		if err != nil {
 			log.Warnf("route table query failed: %v", err)
 			return
@@ -425,19 +425,17 @@ func (r *raLatencyBCC) routeTableWorker(routeProvider utils.BCCRouteServerProvid
 	}
 }
 
-// startMonitoring initializes cloud Route Server observers, route table workers, and Kubernetes informers.
+// startMonitoring creates the cloud Route Server provider and starts the workers and Kubernetes watchers.
 func (r *raLatencyBCC) startMonitoring() error {
 	r.routeTimestamps = sync.Map{}
 
 	// Create cloud provider based on configuration
 	var routeProvider utils.BCCRouteServerProvider
-	var routeTableResourceID string
 	var err error
 
 	switch r.cloudProvider {
 	case cloudProviderAWS:
-		routeProvider, err = utils.NewBCCRouteServerObserver(r.inputs["awsRegion"], r.inputs["routeServerId"])
-		routeTableResourceID = r.inputs["vpcId"]
+		routeProvider, err = utils.NewAWSRouteServerProvider(r.inputs["awsRegion"], r.inputs["awsRouteServerId"], r.inputs["awsVpcId"])
 		if err != nil {
 			return fmt.Errorf("failed to create Route Server provider: %w", err)
 		}
@@ -458,7 +456,7 @@ func (r *raLatencyBCC) startMonitoring() error {
 
 	log.Infof("Starting route table worker")
 	r.wg.Add(1)
-	go r.routeTableWorker(routeProvider, routeTableCheckCh, routeTableResourceID)
+	go r.routeTableWorker(routeProvider, routeTableCheckCh)
 
 	r.podIPCh = make(chan podIPNotification, 100)
 	r.wg.Add(1)

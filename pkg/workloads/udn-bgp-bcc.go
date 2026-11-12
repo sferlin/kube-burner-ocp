@@ -75,8 +75,8 @@ func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 
 	// AWS-specific variables
 	var awsRegion string
-	var routeServerID string
-	var vpcId string
+	var awsRouteServerID string
+	var awsVpcId string
 
 	// Azure-specific variables
 	var azureSubscriptionID string
@@ -94,10 +94,10 @@ func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 
 			switch cloudProvider {
 			case "aws":
-				if routeServerID == "" || awsRegion == "" || vpcId == "" {
-					return fmt.Errorf("--route-server-id, --aws-region, and --vpc-id are required")
+				if awsRouteServerID == "" || awsRegion == "" || awsVpcId == "" {
+					return fmt.Errorf("--aws-route-server-id, --aws-region, and --aws-vpc-id are required")
 				}
-				if err := utils.ValidateAWSConnectivity(awsRegion, routeServerID, vpcId); err != nil {
+				if err := utils.ValidateAWSConnectivity(awsRegion, awsRouteServerID, awsVpcId); err != nil {
 					return err
 				}
 			case "azure":
@@ -121,8 +121,8 @@ func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 			switch cloudProvider {
 			case "aws":
 				AdditionalVars["AWS_REGION"] = awsRegion
-				AdditionalVars["ROUTE_SERVER_ID"] = routeServerID
-				AdditionalVars["VPC_ID"] = vpcId
+				AdditionalVars["AWS_ROUTE_SERVER_ID"] = awsRouteServerID
+				AdditionalVars["AWS_VPC_ID"] = awsVpcId
 			case "azure":
 				AdditionalVars["AZURE_SUBSCRIPTION_ID"] = azureSubscriptionID
 				AdditionalVars["AZURE_RESOURCE_GROUP"] = azureResourceGroup
@@ -148,12 +148,12 @@ func NewUdnBgpBCC(wh *workloads.WorkloadHelper, variant string) *cobra.Command {
 
 	// AWS-specific flags
 	cmd.Flags().StringVar(&awsRegion, "aws-region", "", "[AWS] AWS region containing the Route Server")
-	cmd.Flags().StringVar(&routeServerID, "route-server-id", "", "[AWS] AWS Route Server ID")
-	cmd.Flags().StringVar(&vpcId, "vpc-id", "", "[AWS] AWS VPC ID for route table verification (T3 measurement)")
+	cmd.Flags().StringVar(&awsRouteServerID, "aws-route-server-id", "", "[AWS] AWS Route Server ID")
+	cmd.Flags().StringVar(&awsVpcId, "aws-vpc-id", "", "[AWS] AWS VPC ID for route table verification (T3/T3.5 measurement)")
 
 	// Azure-specific flags
 	cmd.Flags().StringVar(&azureSubscriptionID, "azure-subscription-id", "", "[Azure] Azure subscription ID")
-	cmd.Flags().StringVar(&azureResourceGroup, "azure-resource-group", "", "[Azure] Azure resource group containing Route Server")
+	cmd.Flags().StringVar(&azureResourceGroup, "azure-resource-group", "", "[Azure] Resource group of the Azure Route Server (not the ARO cluster resource group)")
 	cmd.Flags().StringVar(&azureRouteServerName, "azure-route-server-name", "", "[Azure] Azure Route Server name")
 	return cmd
 }
